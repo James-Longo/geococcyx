@@ -1,0 +1,29 @@
+{
+  "units": "mi",
+  "autoLapMeters": 1609.344,
+  "autoPause": false,
+  "screens": [
+    ["time", "distance", "pace", "hr"],
+    ["lapTime", "lapPace", "lapDistance", "lastLap"],
+    ["avgPace", "lastLapPace", "clock", "hr"]
+  ],
+  "workouts": [
+    {"name": "6x800", "steps": [
+      {"name": "Warm up", "lap": true},
+      {"repeat": 6, "steps": [
+        {"name": "800", "meters": 800, "pace": ["5:50", "6:05"]},
+        {"name": "Jog", "seconds": 120}
+      ]},
+      {"name": "Cool down", "lap": true}
+    ]},
+    {"name": "Tempo 3 mi", "steps": [
+      {"name": "Warm up", "lap": true},
+      {"name": "Tempo", "meters": 4828, "pace": ["6:25", "6:40"]},
+      {"name": "Cool down", "lap": true}
+    ]}
+  ],
+  "races": [
+    {"name": "5K", "meters": 5000, "target": "18:30"},
+    {"name": "XC 8K", "meters": 8000, "target": "30:00"}
+  ]
+}

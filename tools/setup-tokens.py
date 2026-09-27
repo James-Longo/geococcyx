@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""setup-tokens.py — one-time sign-in to Strava and Google Health for the watch.
+
+Writes ../config.json: tools/config.example.json settings (or the existing
+config.json) plus the credentials the watch needs to upload runs.
+
+  python3 tools/setup-tokens.py strava   # needs secrets/strava-client.json {"client_id","client_secret"}
+  python3 tools/setup-tokens.py google   # reuses the Journal's Google Health OAuth client
+"""
+import http.server
+import importlib.util
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+import webbrowser
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+CONFIG = os.path.join(ROOT, "config.json")
+JOURNAL = os.path.expanduser("~/Projects/Journal")
+STRAVA_CLIENT = os.path.join(JOURNAL, "secrets", "strava-client.json")
+
+
+def load_config():
+    path = CONFIG if os.path.exists(CONFIG) else os.path.join(HERE, "config.example.json")
+    return json.load(open(path))
+
+
+def save_config(cfg):
+    fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print("wrote", CONFIG)
+
+
+def wait_for_code(url_for):
+    """Serve one loopback redirect and return its query parameters."""
+    got = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            got.update(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Done - you can close this tab.")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    url = url_for(f"http://127.0.0.1:{srv.server_port}")
+    print("Opening browser:\n" + url, flush=True)
+    webbrowser.open(url)
+    while "code" not in got and "error" not in got:
+        srv.handle_request()
+    if "error" in got:
+        sys.exit("Denied: " + got["error"][0])
+    return got["code"][0], f"http://127.0.0.1:{srv.server_port}"
+
+
+def strava():
+    c = json.load(open(STRAVA_CLIENT))
+    code, _ = wait_for_code(lambda redirect: "https://www.strava.com/oauth/authorize?" + urllib.parse.urlencode({
+        "client_id": c["client_id"], "redirect_uri": redirect, "response_type": "code",
+        "approval_prompt": "force", "scope": "activity:write,activity:read_all"}))
+    tok = json.load(urllib.request.urlopen(urllib.request.Request(
+        "https://www.strava.com/oauth/token", urllib.parse.urlencode({
+            "client_id": c["client_id"], "client_secret": c["client_secret"],
+            "code": code, "grant_type": "authorization_code"}).encode())))
+    cfg = load_config()
+    cfg["strava"] = {"clientId": str(c["client_id"]), "clientSecret": c["client_secret"],
+                     "refreshToken": tok["refresh_token"]}
+    save_config(cfg)
+
+
+def google():
+    spec = importlib.util.spec_from_file_location("h", os.path.join(JOURNAL, "src", "health-api.py"))
+    h = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(h)
+    h.SCOPES = ["https://www.googleapis.com/auth/googlehealth.activity_and_fitness.writeonly"]
+    client = next(iter(json.load(open(h.CLIENT)).values()))
+    tok = h.consent(client)
+    cfg = load_config()
+    cfg["google"] = {"clientId": client["client_id"], "clientSecret": client["client_secret"],
+                     "refreshToken": tok["refresh_token"]}
+    save_config(cfg)
+
+
+if __name__ == "__main__":
+    {"strava": strava, "google": google}.get(sys.argv[1] if len(sys.argv) > 1 else "", lambda: sys.exit(__doc__))()
