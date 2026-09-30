@@ -3,3 +3,7 @@ build/
 local.properties
 config.json
 *.keystore
+strava-client.json
+google-client.json
+run-backups/
+__pycache__/

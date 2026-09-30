@@ -1,0 +1,17 @@
+<!-- App icon: a running roadrunner (genus Geococcyx), black on the accent circle. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp" android:height="48dp"
+    android:viewportWidth="100" android:viewportHeight="100">
+    <path android:fillColor="#C8F23A" android:pathData="M50,0A50,50 0,1 0,50 100A50,50 0,1 0,50 0Z" />
+    <group android:scaleX="0.86" android:scaleY="0.86" android:translateX="7.43" android:translateY="12.16">
+        <path android:fillColor="#000000" android:pathData="M36,53 L38,43 C28,36 16,27 5,19 Q2,21 4,24 C14,33 25,45 36,53 Z" />
+        <path android:fillColor="#000000" android:pathData="M34,47 C42,40 54,38 62,39 C64,33 67,27 73,26 C78,25 80,29 79,31 L79,33 C75,35 71,36 69,40 C67,46 64,51 56,54 C48,57 38,56 34,52 Z" />
+        <path android:fillColor="#000000" android:pathData="M71,27 L62,13 L69,21 L66,11 L73,21 L72,13 L76,25 Z" />
+        <path android:fillColor="#000000" android:pathData="M78,29.5 L96,32.5 L78,33.5 Z" />
+        <path android:fillColor="#C8F23A" android:pathData="M73,29 A1.5,1.5 0,1 0,76 29 A1.5,1.5 0,1 0,73 29 Z" />
+        <path android:strokeColor="#000000" android:strokeWidth="4.4" android:strokeLineCap="round" android:strokeLineJoin="round"
+            android:pathData="M56,53 L66,62 L74,66 M74,66 L79,64 M74,66 L78,69" />
+        <path android:strokeColor="#000000" android:strokeWidth="4.4" android:strokeLineCap="round" android:strokeLineJoin="round"
+            android:pathData="M50,55 L46,66 L34,74 M34,74 L30,72 M34,74 L31,77" />
+    </group>
+</vector>

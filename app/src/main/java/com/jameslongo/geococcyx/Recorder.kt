@@ -1,4 +1,4 @@
-package com.jameslongo.truerun
+package com.jameslongo.geococcyx
 
 import org.json.JSONArray
 import org.json.JSONObject
@@ -13,18 +13,24 @@ data class Lap(
 )
 data class Event(val t: Long, val type: String)
 
+/** Where a run stood when its journal was last written. */
+data class Replay(
+    val mode: String, val workout: String?, val race: String?,
+    val lapEndWall: Long = 0, val lapEndActive: Long = 0, val lapEndMeters: Double = 0.0,
+    val stepIdx: Int = 0, val stepStartActive: Long = 0, val stepStartMeters: Double = 0.0,
+)
+
 /**
  * Everything one run records, keyed by each sample's own timestamp (epoch ms).
- * Every sample is also appended to [journal] so a crash doesn't lose the run.
+ * Every sample is also appended to [journalFile] so a crash doesn't lose the run.
  */
-class Recorder(private val journal: File) {
-    val start = System.currentTimeMillis()
+class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis()) {
     val locs = ArrayList<Loc>()
     val hr = ArrayList<Pair<Long, Int>>()
     val laps = ArrayList<Lap>()
     val events = ArrayList<Event>()
 
-    private fun log(line: String) = journal.appendText(line + "\n")
+    private fun log(line: String) = journalFile.appendText(line + "\n")
 
     fun addLoc(l: Loc) {
         // Health Services can redeliver a batch; keep samples strictly in time order.
@@ -44,9 +50,24 @@ class Recorder(private val journal: File) {
         log("E,$t,$type")
     }
 
-    fun addLap(lap: Lap) {
+    /** [activeAtEnd] and [metersAtEnd] let a restarted service carry on from this lap. */
+    fun addLap(lap: Lap, activeAtEnd: Long, metersAtEnd: Double) {
         laps += lap
-        log("P,${lap.start},${lap.end},${lap.activeMs},${lap.meters},${lap.trigger}")
+        log("P,${lap.start},${lap.end},${lap.activeMs},${lap.meters},${lap.trigger},$activeAtEnd,$metersAtEnd")
+    }
+
+    fun logMeta(mode: String, workout: String?, race: String?) =
+        log("M,${start},${mode.replace(",", " ")},${workout.orEmpty().replace(",", " ")},${race.orEmpty().replace(",", " ")}")
+
+    fun logStep(idx: Int, activeAtStart: Long, metersAtStart: Double) = log("S,$idx,$activeAtStart,$metersAtStart")
+
+    /** GPS path length, used only when a crashed run has to be saved without Health Services' total. */
+    fun gpsMeters(): Double = locs.zipWithNext().sumOf { (a, b) -> haversine(a, b) }
+
+    /** Active time from the event log, used only for crash recovery. */
+    fun activeFromEvents(end: Long): Long {
+        val first = events.firstOrNull { it.type == "START" }?.t ?: return 0
+        return (end - first) - pauses().sumOf { (minOf(it.last, end) - it.first).coerceAtLeast(0) }
     }
 
     fun avgHr(from: Long, to: Long): Int? =
@@ -101,7 +122,7 @@ class Recorder(private val journal: File) {
             }
             sb.append("</Track></Lap>\n")
         }
-        sb.append("<Creator xsi:type=\"Device_t\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><Name>TrueRun (Pixel Watch)</Name></Creator>\n")
+        sb.append("<Creator xsi:type=\"Device_t\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><Name>Geococcyx (Pixel Watch)</Name></Creator>\n")
         sb.append("</Activity></Activities></TrainingCenterDatabase>\n")
         return sb.toString()
     }
@@ -139,6 +160,42 @@ class Recorder(private val journal: File) {
         .put("endTime", iso(b)).put("endUtcOffset", offset(b))
 
     companion object {
+        /** Rebuilds a run from its journal after the app was killed mid-run. */
+        fun replay(journal: File): Pair<Recorder, Replay> {
+            val lines = journal.readLines().map { it.split(",") }
+            val meta = lines.firstOrNull { it[0] == "M" }
+            val rec = Recorder(journal, meta?.get(1)?.toLong() ?: lines.firstOrNull()?.getOrNull(1)?.toLongOrNull() ?: 0L)
+            var info = Replay(meta?.getOrNull(2) ?: "Run", meta?.getOrNull(3)?.ifEmpty { null }, meta?.getOrNull(4)?.ifEmpty { null })
+            for (f in lines) runCatching {
+                when (f[0]) {
+                    "L" -> rec.locs += Loc(f[1].toLong(), f[2].toDouble(), f[3].toDouble(), f.getOrNull(4)?.toDoubleOrNull())
+                    "H" -> rec.hr += f[1].toLong() to f[2].toInt()
+                    "E" -> rec.events += Event(f[1].toLong(), f[2])
+                    "P" -> {
+                        rec.laps += Lap(f[1].toLong(), f[2].toLong(), f[3].toLong(), f[4].toDouble(), f[5], null)
+                        info = info.copy(lapEndWall = f[2].toLong(), lapEndActive = f[6].toLong(), lapEndMeters = f[7].toDouble())
+                    }
+                    "S" -> info = info.copy(stepIdx = f[1].toInt(), stepStartActive = f[2].toLong(), stepStartMeters = f[3].toDouble())
+                }
+            }
+            if (info.lapEndWall == 0L) info = info.copy(lapEndWall = rec.events.firstOrNull { it.type == "START" }?.t ?: rec.start)
+            return rec to info
+        }
+
+        fun haversine(a: Loc, b: Loc): Double {
+            val r = 6371000.0
+            val p1 = Math.toRadians(a.lat); val p2 = Math.toRadians(b.lat)
+            val dp = p2 - p1; val dl = Math.toRadians(b.lon - a.lon)
+            val h = Math.sin(dp / 2).let { it * it } + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2).let { it * it }
+            return 2 * r * Math.asin(Math.sqrt(h))
+        }
+
+        /**
+         * Health Services reports a missing altitude as Double.MAX_VALUE (seen on a Pixel Watch 3), not NaN;
+         * keep only readings that could be somewhere on Earth.
+         */
+        fun altitude(m: Double): Double? = m.takeIf { it.isFinite() && it in -500.0..9000.0 }
+
         fun iso(t: Long): String = Instant.ofEpochMilli(t).toString()
         fun offset(t: Long) = "${TimeZone.getDefault().getOffset(t) / 1000}s"
     }

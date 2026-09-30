@@ -1,4 +1,4 @@
-package com.jameslongo.truerun
+package com.jameslongo.geococcyx
 
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -16,19 +16,19 @@ fun fmtPace(secPerMeter: Double?, perUnit: Double): String {
 
 fun fmtDist(m: Double, perUnit: Double) = "%.2f".format(m / perUnit)
 
-/** Data-screen fields, by the keys used in config.json "screens": label to value. */
+/** Data-screen fields, by the keys used in config.json "fields": label to value. */
 fun field(key: String, s: RunState, c: Config): Pair<String, String> {
     val u = c.metersPerUnit
     val avg = if (s.meters > 10) s.activeMs / 1000.0 / s.meters else null
     return when (key) {
         "time" -> "TIME" to fmtDur(s.activeMs)
-        "distance" -> c.unitLabel.uppercase() to fmtDist(s.meters, u)
+        "distance" -> (if (c.unitLabel == "mi") "MILES" else "KM") to fmtDist(s.meters, u)
         "pace" -> "PACE" to fmtPace(s.pace, u)
-        "avgPace" -> "AVG PACE" to fmtPace(avg, u)
+        "avgPace" -> "AVG" to fmtPace(avg, u)
         "hr" -> "HR" to (s.hr?.toString() ?: "--")
         "lap" -> "LAP" to s.lapNo.toString()
         "lapTime" -> "LAP ${s.lapNo}" to fmtDur(s.lapMs)
-        "lapPace" -> "LAP PACE" to fmtPace(if (s.lapMeters > 10) s.lapMs / 1000.0 / s.lapMeters else null, u)
+        "lapPace" -> (if (c.unitLabel == "mi") "MILE" else "KM") to fmtPace(if (s.lapMeters > 10) s.lapMs / 1000.0 / s.lapMeters else null, u)
         "lapDistance" -> "LAP ${c.unitLabel.uppercase()}" to fmtDist(s.lapMeters, u)
         "lastLap" -> "LAST LAP" to (s.lastLapMs?.let { fmtDur(it) } ?: "--")
         "lastLapPace" -> "LAST PACE" to fmtPace(

@@ -1,32 +1,35 @@
-package com.jameslongo.truerun
+package com.jameslongo.geococcyx
 
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-/** Settings, workouts, races and API credentials, read from files/config.json (pushed with tools/push-config.sh). */
+/** Settings, workouts, races and API credentials, read from files/config.json (pushed by tools/install.sh). */
 data class Config(
     val metersPerUnit: Double,
     val unitLabel: String,
     val autoLapMeters: Double,
     val autoPause: Boolean,
-    val screens: List<List<String>>,
+    /** The run screen's fields: top, middle left, middle right, bottom (keys in Fields.kt). */
+    val fields: List<String>,
     val workouts: List<Workout>,
     val races: List<Race>,
     val strava: Creds?,
     val google: Creds?,
+    /** With [google] signed in: copy each saved run's TCX to Drive, and/or post its summary to Google Health. */
+    val drive: Boolean,
+    val googleHealth: Boolean,
 ) {
     companion object {
-        private val DEFAULT_SCREENS = listOf(
-            listOf("time", "distance", "pace", "hr"),
-            listOf("lapTime", "lapPace", "lapDistance", "lastLap"),
-            listOf("avgPace", "clock", "lap", "hr"),
-        )
+        private val DEFAULT_FIELDS = listOf("distance", "lapPace", "avgPace", "time")
 
         fun load(ctx: Context): Config {
+            // A pushed files/config.json overrides the one built into the app.
             val f = File(ctx.filesDir, "config.json")
-            val j = if (f.exists()) JSONObject(f.readText()) else JSONObject()
+            val text = if (f.exists()) f.readText()
+                else runCatching { ctx.assets.open("config.json").bufferedReader().readText() }.getOrNull()
+            val j = text?.let(::JSONObject) ?: JSONObject()
             val km = j.optString("units", "mi") == "km"
             val perUnit = if (km) 1000.0 else 1609.344
             return Config(
@@ -34,13 +37,13 @@ data class Config(
                 unitLabel = if (km) "km" else "mi",
                 autoLapMeters = j.optDouble("autoLapMeters", perUnit),
                 autoPause = j.optBoolean("autoPause", false),
-                screens = j.optJSONArray("screens")?.let { a ->
-                    (0 until a.length()).map { i -> a.getJSONArray(i).strings() }
-                } ?: DEFAULT_SCREENS,
+                fields = j.optJSONArray("fields")?.strings() ?: DEFAULT_FIELDS,
                 workouts = j.optJSONArray("workouts").objects().map { Workout.parse(it, perUnit) },
                 races = j.optJSONArray("races").objects().map { Race.parse(it) },
                 strava = j.optJSONObject("strava")?.let(Creds::parse),
                 google = j.optJSONObject("google")?.let(Creds::parse),
+                drive = j.optBoolean("drive", true),
+                googleHealth = j.optBoolean("googleHealth", false),
             )
         }
     }

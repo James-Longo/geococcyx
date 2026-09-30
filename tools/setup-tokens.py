@@ -4,11 +4,10 @@
 Writes ../config.json: tools/config.example.json settings (or the existing
 config.json) plus the credentials the watch needs to upload runs.
 
-  python3 tools/setup-tokens.py strava   # needs secrets/strava-client.json {"client_id","client_secret"}
-  python3 tools/setup-tokens.py google   # reuses the Journal's Google Health OAuth client
+  python3 tools/setup-tokens.py strava   # needs ../strava-client.json {"client_id","client_secret"} (gitignored)
+  python3 tools/setup-tokens.py google   # needs ../google-client.json, a Google OAuth desktop client (gitignored)
 """
 import http.server
-import importlib.util
 import json
 import os
 import sys
@@ -19,8 +18,11 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONFIG = os.path.join(ROOT, "config.json")
-JOURNAL = os.path.expanduser("~/Projects/Journal")
-STRAVA_CLIENT = os.path.join(JOURNAL, "secrets", "strava-client.json")
+STRAVA_CLIENT = os.path.join(ROOT, "strava-client.json")
+GOOGLE_CLIENT = os.path.join(ROOT, "google-client.json")
+# Drive: only files this app creates (its run folder). Health: write workouts.
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive.file",
+                 "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.writeonly"]
 
 
 def load_config():
@@ -76,17 +78,19 @@ def strava():
 
 
 def google():
-    spec = importlib.util.spec_from_file_location("h", os.path.join(JOURNAL, "src", "health-api.py"))
-    h = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(h)
-    h.SCOPES = ["https://www.googleapis.com/auth/googlehealth.activity_and_fitness.writeonly"]
-    client = next(iter(json.load(open(h.CLIENT)).values()))
-    tok = h.consent(client)
+    # The client file as Google Cloud downloads it: {"installed": {...}} (or "web").
+    client = next(iter(json.load(open(GOOGLE_CLIENT)).values()))
+    code, redirect = wait_for_code(lambda redirect: "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": client["client_id"], "redirect_uri": redirect, "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES), "access_type": "offline", "prompt": "consent"}))
+    tok = json.load(urllib.request.urlopen(urllib.request.Request(
+        "https://oauth2.googleapis.com/token", urllib.parse.urlencode({
+            "client_id": client["client_id"], "client_secret": client["client_secret"],
+            "code": code, "redirect_uri": redirect, "grant_type": "authorization_code"}).encode())))
     cfg = load_config()
     cfg["google"] = {"clientId": client["client_id"], "clientSecret": client["client_secret"],
                      "refreshToken": tok["refresh_token"]}
     save_config(cfg)
-
 
 if __name__ == "__main__":
     {"strava": strava, "google": google}.get(sys.argv[1] if len(sys.argv) > 1 else "", lambda: sys.exit(__doc__))()

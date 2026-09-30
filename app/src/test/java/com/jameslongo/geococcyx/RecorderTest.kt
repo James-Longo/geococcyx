@@ -1,4 +1,4 @@
-package com.jameslongo.truerun
+package com.jameslongo.geococcyx
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -27,12 +27,19 @@ class RecorderTest {
             prevT = t
         }
         rec.addEvent("STOP", prevT)
-        rec.addLap(Lap(rec.start.coerceAtMost(rec.locs.first().t), prevT, 2_423_000, 8800.0, "MANUAL", rec.avgHr(0, Long.MAX_VALUE)))
+        rec.addLap(Lap(rec.start.coerceAtMost(rec.locs.first().t), prevT, 2_423_000, 8800.0, "MANUAL", rec.avgHr(0, Long.MAX_VALUE)), 2_423_000, 8800.0)
         val out = rec.toTcx()
         val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(out.byteInputStream())
         assertEquals(tps.length, doc.getElementsByTagName("Trackpoint").length)
         assertEquals(2, doc.getElementsByTagName("Track").length)  // split at the pause
         assertTrue(doc.getElementsByTagName("HeartRateBpm").length > 1500)
         File("build/friday-roundtrip.tcx").writeText(out)
+
+        // A journal replay must rebuild the same run.
+        val (again, info) = Recorder.replay(rec.journalFile)
+        assertEquals(rec.locs.size, again.locs.size)
+        assertEquals(rec.hr.size, again.hr.size)
+        assertEquals(2_423_000, info.lapEndActive)
+        assertEquals(2_423_000.0, again.activeFromEvents(prevT).toDouble(), 10_000.0)
     }
 }

@@ -1,4 +1,4 @@
-package com.jameslongo.truerun
+package com.jameslongo.geococcyx
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -19,11 +19,13 @@ import androidx.health.services.client.data.DataType
 import androidx.health.services.client.data.ExerciseConfig
 import androidx.health.services.client.data.ExerciseLapSummary
 import androidx.health.services.client.data.ExerciseState
+import androidx.health.services.client.data.ExerciseTrackedStatus
 import androidx.health.services.client.data.ExerciseType
 import androidx.health.services.client.data.ExerciseUpdate
 import androidx.health.services.client.data.LocationAvailability
 import androidx.health.services.client.data.WarmUpConfig
 import androidx.lifecycle.LifecycleService
+import androidx.wear.ongoing.OngoingActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -49,6 +51,16 @@ data class RunState(
     val lapMeters: Double = 0.0,
     val lastLapMs: Long? = null,
     val lastLapMeters: Double? = null,
+    val lastLapNo: Int = 0,
+    /** Wall-clock time the last lap closed; the UI shows its pace full screen for a few seconds. */
+    val lastLapAt: Long? = null,
+    /** Virtual pacer range, seconds per meter: fastest and slowest allowed. */
+    val pacerFast: Double? = null,
+    val pacerSlow: Double? = null,
+    /** -1 too fast, 0 in range, 1 too slow; null until the pacer has a reading. */
+    val pacerZone: Int? = null,
+    /** Wall-clock time of the last pacer alert; the UI shows it full screen for a few seconds. */
+    val pacerAlertAt: Long? = null,
     val step: Step? = null,
     val stepNo: Int = 0,
     val stepCount: Int = 0,
@@ -86,6 +98,9 @@ class ExerciseService : LifecycleService() {
     private var offTargetSince = 0L
     private var lastPaceBuzz = 0L
     private var raceFinished = false
+    private var pacerCandidate: Int? = null
+    private var pacerCandidateSince = 0L
+    private var recovering = false
 
     private val bootWall get() = System.currentTimeMillis() - SystemClock.elapsedRealtime()
     private fun activeNow() = if (running) cpActive + (System.currentTimeMillis() - cpWall) else cpActive
@@ -94,6 +109,7 @@ class ExerciseService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_START -> start(intent)
+            ACTION_RECOVER -> recover()
             ACTION_GO -> go()
             ACTION_CANCEL -> cancel()
             ACTION_PAUSE -> lifecycleScope.launch { client.pauseExerciseAsync().await() }
@@ -109,10 +125,15 @@ class ExerciseService : LifecycleService() {
         cfg = Config.load(this)
         workout = cfg.workouts.firstOrNull { it.name == intent.getStringExtra(EXTRA_WORKOUT) }
         val race = cfg.races.firstOrNull { it.name == intent.getStringExtra(EXTRA_RACE) }
+        val pacerFast = intent.getDoubleExtra(EXTRA_PACER_FAST, 0.0).takeIf { it > 0 }
+        val pacerSlow = intent.getDoubleExtra(EXTRA_PACER_SLOW, 0.0).takeIf { it > 0 }
+        pacerCandidate = null
         val dir = File(filesDir, "runs").apply { mkdirs() }
         rec = Recorder(File(dir, "current.journal").apply { delete() })
+        rec.logMeta(workout?.name ?: race?.name ?: "Run", workout?.name, race?.name)
         RunRepo.state.value = RunState(
             status = Status.STARTING,
+            pacerFast = pacerFast, pacerSlow = pacerSlow,
             mode = workout?.name ?: race?.name ?: "Run",
             step = workout?.steps?.firstOrNull(),
             stepCount = workout?.steps?.size ?: 0,
@@ -147,6 +168,45 @@ class ExerciseService : LifecycleService() {
         }
     }
 
+    /**
+     * The app was killed mid-run. If Health Services still has our exercise going, pick it
+     * back up where the journal left off; otherwise save what the journal holds.
+     */
+    // Lint flags these documented ExerciseTrackedStatus constants as library-internal in 1.1.0.
+    @android.annotation.SuppressLint("RestrictedApi", "WrongConstant")
+    private fun recover() {
+        val journal = File(File(filesDir, "runs"), "current.journal")
+        if (!journal.exists() || RunRepo.state.value.status != Status.IDLE) return
+        cfg = Config.load(this)
+        val (r, info) = Recorder.replay(journal)
+        // Killed during warm-up: nothing was recorded.
+        if (r.events.none { it.type == "START" }) { journal.delete(); stopSelf(); return }
+        rec = r
+        workout = cfg.workouts.firstOrNull { it.name == info.workout }
+        lapStartWall = info.lapEndWall; lapStartActive = info.lapEndActive; lapStartMeters = info.lapEndMeters
+        stepIdx = info.stepIdx; stepStartActive = info.stepStartActive; stepStartMeters = info.stepStartMeters
+        RunRepo.state.value = RunState(
+            status = Status.ACTIVE, mode = info.mode,
+            step = workout?.steps?.getOrNull(stepIdx), stepNo = stepIdx, stepCount = workout?.steps?.size ?: 0,
+            race = cfg.races.firstOrNull { it.name == info.race }, meters = info.lapEndMeters,
+        )
+        ServiceCompat.startForeground(
+            this, 1, notification(),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+        )
+        lifecycleScope.launch {
+            val tracked = client.getCurrentExerciseInfoAsync().await().exerciseTrackedStatus
+            if (tracked == ExerciseTrackedStatus.OWNED_EXERCISE_IN_PROGRESS) {
+                recovering = true
+                client.setUpdateCallback(callback)
+                tick()
+            } else {
+                val end = maxOf(rec.locs.lastOrNull()?.t ?: 0, rec.hr.lastOrNull()?.first ?: 0, rec.start)
+                finish(rec.activeFromEvents(end), rec.gpsMeters(), end)
+            }
+        }
+    }
+
     private val callback = object : ExerciseUpdateCallback {
         override fun onRegistered() {}
         override fun onRegistrationFailed(throwable: Throwable) {}
@@ -167,7 +227,7 @@ class ExerciseService : LifecycleService() {
         // Each sample keeps its own sensor timestamp, never the delivery time.
         m.getData(DataType.LOCATION).forEach { p ->
             val v = p.value
-            rec.addLoc(Loc(p.getTimeInstant(boot).toEpochMilli(), v.latitude, v.longitude, v.altitude.takeIf { !it.isNaN() }))
+            rec.addLoc(Loc(p.getTimeInstant(boot).toEpochMilli(), v.latitude, v.longitude, Recorder.altitude(v.altitude)))
         }
         m.getData(DataType.HEART_RATE_BPM).forEach { p -> rec.addHr(p.getTimeInstant(boot).toEpochMilli(), p.value.toInt()) }
         val total = m.getData(DataType.DISTANCE_TOTAL)?.total
@@ -189,6 +249,8 @@ class ExerciseService : LifecycleService() {
     }
 
     private fun onStatus(prev: Status, now: Status) {
+        // After a crash the first update only re-syncs state; its events are already in the journal.
+        if (recovering) { recovering = false; if (now == Status.ENDED) finish(); return }
         when {
             prev == Status.STARTING && now == Status.ACTIVE -> {
                 rec.addEvent("START")
@@ -224,6 +286,7 @@ class ExerciseService : LifecycleService() {
             } else if (wo == null && s.meters - lapStartMeters >= cfg.autoLapMeters) {
                 lap("DISTANCE")
             }
+            if (running) checkPacer(pace, act)
             s.race?.let { r -> if (!raceFinished && s.meters >= r.meters) { raceFinished = true; buzz(TRIPLE) } }
 
             update {
@@ -252,12 +315,32 @@ class ExerciseService : LifecycleService() {
         update { it.copy(paceFlag = flag) }
     }
 
+    /**
+     * Virtual pacer: alerts once when the rolling pace leaves the range and once when it comes back.
+     * A zone must hold for PACER_SETTLE_MS so GPS jitter doesn't set it off, and the standing start
+     * (PACER_GRACE_MS) is ignored. The first reading only alerts if it's already out of range.
+     */
+    private fun checkPacer(pace: Double?, act: Long) {
+        val s = RunRepo.state.value
+        val fast = s.pacerFast ?: return
+        val slow = s.pacerSlow ?: return
+        if (pace == null || act < PACER_GRACE_MS) return
+        val zone = when { pace < fast -> -1; pace > slow -> 1; else -> 0 }
+        val now = System.currentTimeMillis()
+        if (zone != pacerCandidate) { pacerCandidate = zone; pacerCandidateSince = now }
+        if (zone == s.pacerZone || now - pacerCandidateSince < PACER_SETTLE_MS) return
+        if (s.pacerZone == null && zone == 0) return update { it.copy(pacerZone = 0) }
+        buzz(when (zone) { -1 -> TOO_FAST; 1 -> TOO_SLOW; else -> BACK_ON_PACE })
+        update { it.copy(pacerZone = zone, pacerAlertAt = now) }
+    }
+
     private fun advanceStep(trigger: String) {
         val wo = workout ?: return
         lap(trigger, fromStep = true)
         stepIdx++
         stepStartActive = activeNow()
         stepStartMeters = RunRepo.state.value.meters
+        rec.logStep(stepIdx, stepStartActive, stepStartMeters)
         offTargetSince = 0
         buzz(if (stepIdx >= wo.steps.size) TRIPLE else LONG)
         update { it.copy(step = wo.steps.getOrNull(stepIdx), stepNo = stepIdx, paceFlag = 0) }
@@ -270,24 +353,28 @@ class ExerciseService : LifecycleService() {
         if (!fromStep && workout?.steps?.getOrNull(stepIdx)?.untilLap == true) return advanceStep(trigger)
         val now = System.currentTimeMillis()
         val act = activeNow()
-        rec.addLap(Lap(lapStartWall, now, act - lapStartActive, s.meters - lapStartMeters, trigger, rec.avgHr(lapStartWall, now)))
-        update { it.copy(lastLapMs = act - lapStartActive, lastLapMeters = s.meters - lapStartMeters) }
+        rec.addLap(Lap(lapStartWall, now, act - lapStartActive, s.meters - lapStartMeters, trigger, rec.avgHr(lapStartWall, now)), act, s.meters)
+        update { it.copy(lastLapMs = act - lapStartActive, lastLapMeters = s.meters - lapStartMeters, lastLapNo = rec.laps.size, lastLapAt = now) }
         lapStartWall = now; lapStartActive = act; lapStartMeters = s.meters
-        if (!fromStep) buzz(SHORT)
+        if (!fromStep) buzz(if (trigger == "DISTANCE") MILE else SHORT)
     }
 
-    private fun finish() {
-        val now = System.currentTimeMillis()
+    private fun finish(activeMs: Long = cpActive, meters: Double = RunRepo.state.value.meters, now: Long = System.currentTimeMillis()) {
         rec.addEvent("STOP", now)
+        cpActive = activeMs
+        update { it.copy(meters = meters) }
         val s = RunRepo.state.value
         if (now - lapStartWall > 2000 || rec.laps.isEmpty()) {
-            rec.addLap(Lap(lapStartWall, now, cpActive - lapStartActive, s.meters - lapStartMeters, "MANUAL", rec.avgHr(lapStartWall, now)))
+            rec.addLap(Lap(lapStartWall, now, cpActive - lapStartActive, s.meters - lapStartMeters, "MANUAL", rec.avgHr(lapStartWall, now)), cpActive, s.meters)
         }
         val base = File(File(filesDir, "runs"), Recorder.iso(rec.start).replace(":", ""))
         File("$base.tcx").writeText(rec.toTcx())
         File("$base.health.json").writeText(rec.toGoogleHealth(s.mode, cpActive, s.meters).toString())
-        File("$base.meta.json").writeText(org.json.JSONObject().put("name", s.mode).put("activeMs", cpActive).put("meters", s.meters).toString())
+        File("$base.meta.json").writeText(org.json.JSONObject().put("name", s.mode).put("activeMs", cpActive).put("meters", s.meters)
+            // Start time and the watch's (network-set) time zone, so the run is named in local time wherever it uploads.
+            .put("start", rec.start).put("tz", java.util.TimeZone.getDefault().id).toString())
         File(File(filesDir, "runs"), "current.journal").delete()
+        // Every finished run is kept and uploaded; nothing on the watch deletes runs.
         SyncWorker.enqueue(this)
         buzz(LONG)
         update { it.copy(status = Status.ENDED, activeMs = cpActive, savedFile = base.name) }
@@ -301,6 +388,7 @@ class ExerciseService : LifecycleService() {
             // Detach first so the ENDED update doesn't save an empty run.
             runCatching { client.clearUpdateCallbackAsync(callback).await() }
             runCatching { client.endExerciseAsync().await() }
+            File(File(filesDir, "runs"), "current.journal").delete()
             RunRepo.state.value = RunState()
             ServiceCompat.stopForeground(this@ExerciseService, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -320,15 +408,21 @@ class ExerciseService : LifecycleService() {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        return NotificationCompat.Builder(this, "run")
-            .setSmallIcon(R.drawable.ic_run).setContentTitle("TrueRun").setContentText("Recording")
+        val builder = NotificationCompat.Builder(this, "run")
+            .setSmallIcon(R.drawable.ic_roadrunner).setContentTitle(getString(R.string.app_name)).setContentText("Recording")
             .setOngoing(true).setContentIntent(open).setCategory(NotificationCompat.CATEGORY_WORKOUT)
-            .build()
+        // Shows a run chip on the watch face that jumps back into the app.
+        OngoingActivity.Builder(this, 1, builder)
+            .setStaticIcon(R.drawable.ic_roadrunner).setTouchIntent(open)
+            .setStatus(androidx.wear.ongoing.Status.Builder().addTemplate("Run").build())
+            .build().apply(this)
+        return builder.build()
     }
 
     companion object {
         const val ACTION_START = "start"
         const val ACTION_GO = "go"
+        const val ACTION_RECOVER = "recover"
         const val ACTION_CANCEL = "cancel"
         const val ACTION_PAUSE = "pause"
         const val ACTION_RESUME = "resume"
@@ -336,14 +430,23 @@ class ExerciseService : LifecycleService() {
         const val ACTION_END = "end"
         const val EXTRA_WORKOUT = "workout"
         const val EXTRA_RACE = "race"
+        const val EXTRA_PACER_FAST = "pacerFast"
+        const val EXTRA_PACER_SLOW = "pacerSlow"
+        private const val PACER_GRACE_MS = 30_000L
+        private const val PACER_SETTLE_MS = 5_000L
         private val SHORT = longArrayOf(0, 150)
         private val DOUBLE = longArrayOf(0, 120, 120, 120)
         private val TRIPLE = longArrayOf(0, 200, 150, 200, 150, 200)
         private val LONG = longArrayOf(0, 500)
+        private val MILE = longArrayOf(0, 400, 150, 400)
+        // Pacer: quick pulses when too fast, one long pull when too slow, a double tap when back in range.
+        private val TOO_FAST = longArrayOf(0, 100, 80, 100, 80, 100, 80, 100)
+        private val TOO_SLOW = longArrayOf(0, 900)
+        private val BACK_ON_PACE = longArrayOf(0, 200, 120, 200)
 
         fun send(ctx: Context, action: String, extras: Intent.() -> Unit = {}) {
             val i = Intent(ctx, ExerciseService::class.java).setAction(action).apply(extras)
-            if (action == ACTION_START) ctx.startForegroundService(i) else ctx.startService(i)
+            if (action == ACTION_START || action == ACTION_RECOVER) ctx.startForegroundService(i) else ctx.startService(i)
         }
     }
 }

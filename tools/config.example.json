@@ -2,11 +2,9 @@
   "units": "mi",
   "autoLapMeters": 1609.344,
   "autoPause": false,
-  "screens": [
-    ["time", "distance", "pace", "hr"],
-    ["lapTime", "lapPace", "lapDistance", "lastLap"],
-    ["avgPace", "lastLapPace", "clock", "hr"]
-  ],
+  "drive": true,
+  "googleHealth": false,
+  "fields": ["distance", "lapPace", "avgPace", "time"],
   "workouts": [
     {"name": "6x800", "steps": [
       {"name": "Warm up", "lap": true},
