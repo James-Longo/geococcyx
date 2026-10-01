@@ -156,7 +156,10 @@ class ExerciseService : LifecycleService() {
         if (RunRepo.state.value.status != Status.STARTING) return
         lifecycleScope.launch {
             val caps = client.getCapabilitiesAsync().await().getExerciseTypeCapabilities(ExerciseType.RUNNING)
-            val wanted = setOf(DataType.LOCATION, DataType.HEART_RATE_BPM, DataType.DISTANCE_TOTAL)
+            val wanted = setOf(
+                DataType.LOCATION, DataType.HEART_RATE_BPM, DataType.DISTANCE_TOTAL,
+                DataType.STEPS_PER_MINUTE, DataType.STRIDE_LENGTH,
+            )
             client.startExerciseAsync(
                 ExerciseConfig.builder(ExerciseType.RUNNING)
                     .setDataTypes(wanted intersect caps.supportedDataTypes)
@@ -230,6 +233,8 @@ class ExerciseService : LifecycleService() {
             rec.addLoc(Loc(p.getTimeInstant(boot).toEpochMilli(), v.latitude, v.longitude, Recorder.altitude(v.altitude)))
         }
         m.getData(DataType.HEART_RATE_BPM).forEach { p -> rec.addHr(p.getTimeInstant(boot).toEpochMilli(), p.value.toInt()) }
+        m.getData(DataType.STEPS_PER_MINUTE).forEach { p -> rec.addCadence(p.getTimeInstant(boot).toEpochMilli(), p.value.toDouble()) }
+        m.getData(DataType.STRIDE_LENGTH).forEach { p -> rec.addStride(p.getTimeInstant(boot).toEpochMilli(), p.value) }
         val total = m.getData(DataType.DISTANCE_TOTAL)?.total
         u.activeDurationCheckpoint?.let {
             cpWall = it.time.toEpochMilli()

@@ -27,6 +27,10 @@ data class Replay(
 class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis()) {
     val locs = ArrayList<Loc>()
     val hr = ArrayList<Pair<Long, Int>>()
+    /** Steps per minute, both feet. */
+    val cadence = ArrayList<Pair<Long, Double>>()
+    /** Meters, as Health Services reports STRIDE_LENGTH. */
+    val stride = ArrayList<Pair<Long, Double>>()
     val laps = ArrayList<Lap>()
     val events = ArrayList<Event>()
 
@@ -43,6 +47,18 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
         if (bpm <= 0 || (hr.isNotEmpty() && t <= hr.last().first)) return
         hr += t to bpm
         log("H,$t,$bpm")
+    }
+
+    fun addCadence(t: Long, spm: Double) {
+        if (spm <= 0 || (cadence.isNotEmpty() && t <= cadence.last().first)) return
+        cadence += t to spm
+        log("C,$t,$spm")
+    }
+
+    fun addStride(t: Long, m: Double) {
+        if (m <= 0 || (stride.isNotEmpty() && t <= stride.last().first)) return
+        stride += t to m
+        log("R,$t,$m")
     }
 
     fun addEvent(type: String, t: Long = System.currentTimeMillis()) {
@@ -73,10 +89,13 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
     fun avgHr(from: Long, to: Long): Int? =
         hr.filter { it.first in from..to }.map { it.second }.takeIf { it.isNotEmpty() }?.average()?.toInt()
 
-    private fun hrAt(t: Long): Int? {
-        // Nearest heart-rate sample within 3 s of the GPS point.
-        var best: Pair<Long, Int>? = null
-        for (h in hr) {
+    private fun avgCadence(from: Long, to: Long): Double? =
+        cadence.filter { it.first in from..to }.map { it.second }.takeIf { it.isNotEmpty() }?.average()
+
+    /** Nearest sample within 3 s of the GPS point. */
+    private fun <T> nearest(series: List<Pair<Long, T>>, t: Long): T? {
+        var best: Pair<Long, T>? = null
+        for (h in series) {
             if (kotlin.math.abs(h.first - t) <= 3000 &&
                 (best == null || kotlin.math.abs(h.first - t) < kotlin.math.abs(best.first - t))
             ) best = h
@@ -101,7 +120,7 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
         val pauses = pauses()
         val sb = StringBuilder()
         sb.append("""<?xml version="1.0" encoding="UTF-8"?>
-<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2">
+<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2" xmlns:ns3="http://www.garmin.com/xmlschemas/ActivityExtension/v2" xmlns:gx="$NS">
 <Activities><Activity Sport="Running"><Id>${iso(start)}</Id>
 """)
         for (lap in laps) {
@@ -116,11 +135,24 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
                 sb.append("<Trackpoint><Time>${iso(l.t)}</Time><Position><LatitudeDegrees>${l.lat}</LatitudeDegrees>")
                 sb.append("<LongitudeDegrees>${l.lon}</LongitudeDegrees></Position>")
                 l.alt?.let { sb.append("<AltitudeMeters>${"%.1f".format(it)}</AltitudeMeters>") }
-                hrAt(l.t)?.let { sb.append("<HeartRateBpm><Value>$it</Value></HeartRateBpm>") }
+                nearest(hr, l.t)?.let { sb.append("<HeartRateBpm><Value>$it</Value></HeartRateBpm>") }
+                // Garmin's RunCadence counts one foot, so it's half of steps per minute.
+                val spm = nearest(cadence, l.t)
+                val len = nearest(stride, l.t)
+                if (spm != null || len != null) {
+                    sb.append("<Extensions>")
+                    spm?.let { sb.append("<ns3:TPX><ns3:RunCadence>${Math.round(it / 2)}</ns3:RunCadence></ns3:TPX>") }
+                    len?.let { sb.append("<gx:StrideLength>${"%.3f".format(it)}</gx:StrideLength>") }
+                    sb.append("</Extensions>")
+                }
                 sb.append("</Trackpoint>\n")
                 prev = l
             }
-            sb.append("</Track></Lap>\n")
+            sb.append("</Track>")
+            avgCadence(lap.start, lap.end)?.let {
+                sb.append("<Extensions><ns3:LX><ns3:AvgRunCadence>${Math.round(it / 2)}</ns3:AvgRunCadence></ns3:LX></Extensions>")
+            }
+            sb.append("</Lap>\n")
         }
         sb.append("<Creator xsi:type=\"Device_t\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><Name>Geococcyx (Pixel Watch)</Name></Creator>\n")
         sb.append("</Activity></Activities></TrainingCenterDatabase>\n")
@@ -160,6 +192,9 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
         .put("endTime", iso(b)).put("endUtcOffset", offset(b))
 
     companion object {
+        /** Namespace for TCX values Garmin's schema has no element for (stride length). */
+        const val NS = "urn:geococcyx:tcx:v1"
+
         /** Rebuilds a run from its journal after the app was killed mid-run. */
         fun replay(journal: File): Pair<Recorder, Replay> {
             val lines = journal.readLines().map { it.split(",") }
@@ -170,6 +205,8 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
                 when (f[0]) {
                     "L" -> rec.locs += Loc(f[1].toLong(), f[2].toDouble(), f[3].toDouble(), f.getOrNull(4)?.toDoubleOrNull())
                     "H" -> rec.hr += f[1].toLong() to f[2].toInt()
+                    "C" -> rec.cadence += f[1].toLong() to f[2].toDouble()
+                    "R" -> rec.stride += f[1].toLong() to f[2].toDouble()
                     "E" -> rec.events += Event(f[1].toLong(), f[2])
                     "P" -> {
                         rec.laps += Lap(f[1].toLong(), f[2].toLong(), f[3].toLong(), f[4].toDouble(), f[5], null)

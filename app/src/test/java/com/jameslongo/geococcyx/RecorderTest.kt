@@ -24,6 +24,8 @@ class RecorderTest {
             if (prevT != 0L && t - prevT > 60_000) { rec.addEvent("PAUSE", prevT + 1000); rec.addEvent("RESUME", t - 1000) }
             rec.addLoc(Loc(t, tx("LatitudeDegrees")!!.toDouble(), tx("LongitudeDegrees")!!.toDouble(), tx("AltitudeMeters")?.toDouble()))
             rec.addHr(t, 150 + i % 20)  // the Google export carries no heart rate
+            rec.addCadence(t, 170.0 + i % 6)
+            rec.addStride(t, 1.05)
             prevT = t
         }
         rec.addEvent("STOP", prevT)
@@ -33,12 +35,18 @@ class RecorderTest {
         assertEquals(tps.length, doc.getElementsByTagName("Trackpoint").length)
         assertEquals(2, doc.getElementsByTagName("Track").length)  // split at the pause
         assertTrue(doc.getElementsByTagName("HeartRateBpm").length > 1500)
+        assertEquals(tps.length, doc.getElementsByTagName("ns3:RunCadence").length)
+        assertEquals("85", doc.getElementsByTagName("ns3:RunCadence").item(0).textContent)  // 170 spm, one foot
+        assertEquals(tps.length, doc.getElementsByTagName("gx:StrideLength").length)
+        assertEquals(1, doc.getElementsByTagName("ns3:AvgRunCadence").length)
         File("build/friday-roundtrip.tcx").writeText(out)
 
         // A journal replay must rebuild the same run.
         val (again, info) = Recorder.replay(rec.journalFile)
         assertEquals(rec.locs.size, again.locs.size)
         assertEquals(rec.hr.size, again.hr.size)
+        assertEquals(rec.cadence.size, again.cadence.size)
+        assertEquals(rec.stride.size, again.stride.size)
         assertEquals(2_423_000, info.lapEndActive)
         assertEquals(2_423_000.0, again.activeFromEvents(prevT).toDouble(), 10_000.0)
     }
