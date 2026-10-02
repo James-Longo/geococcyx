@@ -49,8 +49,8 @@ class MainActivity : ComponentActivity() {
     /**
      * Pixel Watch keeps both button presses for the system, so a firm twist of the crown
      * pauses or resumes instead: [TWIST_PX] of turning within [TWIST_WINDOW_MS] of starting to turn.
-     * In intervals the direction matters: up moves on from an open interval (or resumes when
-     * paused), down pauses.
+     * In intervals the direction matters: up (clockwise) moves on from an open interval (or
+     * resumes when paused), down (counter-clockwise) pauses.
      */
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
         val s = RunRepo.flow.value
@@ -67,7 +67,8 @@ class MainActivity : ComponentActivity() {
         if (now - twistAt > TWIST_WINDOW_MS) { twistAt = now; twistPx = 0f }
         twistPx += if (s.intervals != null) px else kotlin.math.abs(px)
         if (kotlin.math.abs(twistPx) >= TWIST_PX && now - lastToggle > TWIST_COOLDOWN_MS) {
-            val up = twistPx > 0
+            // "Up" in intervals is a clockwise twist (negative AXIS_SCROLL).
+            val up = twistPx < 0
             twistPx = 0f
             lastToggle = now
             val action = when {
