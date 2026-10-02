@@ -1,6 +1,7 @@
 package com.jameslongo.geococcyx
 
 import android.content.Context
+import android.util.Log
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
@@ -20,8 +21,8 @@ import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /**
- * Uploads saved runs: TCX to Strava and to a Google Drive folder, summary to Google Health.
- * A marker file (.strava / .drive / .google) records each success so nothing is sent twice.
+ * Uploads saved runs: TCX to a Google Drive folder (brought into Strava by hand from there),
+ * summary to Google Health. A marker file (.drive / .google) records each success so nothing is sent twice.
  */
 class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
 
@@ -35,63 +36,27 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
             val base = tcx.path.removeSuffix(".tcx")
             val meta = runCatching { JSONObject(File("$base.meta.json").readText()) }.getOrDefault(JSONObject())
             val name = meta.optString("name", "Run")
-            cfg.strava?.let { c ->
-                if (!File("$base.strava").exists()) runCatching { uploadStrava(c, tcx, name) }
-                    .onSuccess { File("$base.strava").writeText(it) }.onFailure { failed = true; log(it) }
-            }
             cfg.google?.takeIf { cfg.drive }?.let { c ->
                 val title = driveTitle(tcx.name, meta.optLong("start").takeIf { it > 0 }, meta.optString("tz").ifEmpty { null }, name)
                 if (!File("$base.drive").exists()) runCatching { uploadDrive(c, tcx, title) }
-                    .onSuccess { File("$base.drive").writeText(it) }.onFailure { failed = true; log(it) }
+                    .onSuccess { File("$base.drive").writeText(it); log("ok   drive ${tcx.name} $it") }
+                    .onFailure { failed = true; log("FAIL drive ${tcx.name} ${it.message}") }
             }
             cfg.google?.takeIf { cfg.googleHealth }?.let { c ->
                 if (!File("$base.google").exists()) runCatching { uploadGoogle(c, File("$base.health.json").readText()) }
-                    .onSuccess { File("$base.google").writeText(it) }.onFailure { failed = true; log(it) }
+                    .onSuccess { File("$base.google").writeText(it); log("ok   health ${tcx.name} $it") }
+                    .onFailure { failed = true; log("FAIL health ${tcx.name} ${it.message}") }
             }
         }
         return if (failed) Result.retry() else Result.success()
     }
 
-    private fun log(t: Throwable) = File(applicationContext.filesDir, "sync.log")
-        .appendText("${java.time.Instant.now()} ${t.message}\n")
-
-    private suspend fun uploadStrava(c: Creds, tcx: File, name: String): String {
-        val token = refresh("https://www.strava.com/oauth/token", c, "strava")
-        val boundary = "----geococcyx${System.nanoTime()}"
-        val conn = URL("https://www.strava.com/api/v3/uploads").openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.setRequestProperty("Authorization", "Bearer $token")
-        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-        conn.outputStream.use { out ->
-            fun field(k: String, v: String) =
-                out.write("--$boundary\r\nContent-Disposition: form-data; name=\"$k\"\r\n\r\n$v\r\n".toByteArray())
-            field("data_type", "tcx")
-            field("sport_type", "Run")
-            // A plain run keeps Strava's own "Afternoon Run"-style name.
-            if (name != "Run") field("name", name)
-            field("external_id", tcx.name)
-            out.write("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"${tcx.name}\"\r\nContent-Type: application/xml\r\n\r\n".toByteArray())
-            out.write(tcx.readBytes())
-            out.write("\r\n--$boundary--\r\n".toByteArray())
-        }
-        return awaitStrava(token, JSONObject(read(conn)).getLong("id"))
-    }
-
-    /** Strava processes uploads asynchronously; wait for the activity or its error. */
-    private suspend fun awaitStrava(token: String, uploadId: Long): String {
-        repeat(40) {
-            val conn = URL("https://www.strava.com/api/v3/uploads/$uploadId").openConnection() as HttpURLConnection
-            conn.setRequestProperty("Authorization", "Bearer $token")
-            val j = JSONObject(read(conn))
-            val err = j.optString("error").takeIf { it.isNotEmpty() && it != "null" }
-            if (!j.isNull("activity_id")) return "activity ${j.getLong("activity_id")}"
-            // Already on Strava (e.g. also synced by Fitbit): count as done, keep the reason.
-            if (err != null && err.contains("duplicate", ignoreCase = true)) return "duplicate: $err"
-            if (err != null) error("Strava: $err")
-            kotlinx.coroutines.delay(3000)
-        }
-        error("Strava still processing upload $uploadId")
+    /** sync.log (read with tools/debug.sh) and logcat; the file keeps its last [LOG_LINES] lines. */
+    private fun log(msg: String) {
+        Log.i("Geococcyx", msg)
+        val f = File(applicationContext.filesDir, "sync.log")
+        val lines = (if (f.exists()) f.readLines() else emptyList()) + "${Instant.now()} $msg"
+        f.writeText(lines.takeLast(LOG_LINES).joinToString("\n", postfix = "\n"))
     }
 
     /** Puts the TCX in the Drive folder [DRIVE_FOLDER] as [title], making the folder on first use; returns the file's id. */
@@ -149,7 +114,7 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         return read(conn)
     }
 
-    /** Exchanges the refresh token; Strava rotates it, so the newest one is kept in tokens.json. */
+    /** Exchanges the refresh token; if Google issues a new one, it is kept in tokens.json. */
     private fun refresh(url: String, c: Creds, key: String): String {
         val store = File(applicationContext.filesDir, "tokens.json")
         val saved = if (store.exists()) JSONObject(store.readText()) else JSONObject()
@@ -177,6 +142,7 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
 
     companion object {
         private const val DRIVE_FOLDER = "Geococcyx"
+        private const val LOG_LINES = 500
         private const val FOLDER_MIME = "application/vnd.google-apps.folder"
 
         fun enqueue(ctx: Context) {

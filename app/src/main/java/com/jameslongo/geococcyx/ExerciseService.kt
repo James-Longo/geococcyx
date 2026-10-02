@@ -35,7 +35,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.time.Instant
 
-enum class Status { IDLE, STARTING, ACTIVE, PAUSED, AUTO_PAUSED, ENDED }
+enum class Status { IDLE, STARTING, ACTIVE, PAUSED, ENDED }
 
 data class RunState(
     val status: Status = Status.IDLE,
@@ -69,6 +69,8 @@ data class RunState(
     /** -1 too fast, 0 on target, 1 too slow. */
     val paceFlag: Int = 0,
     val race: Race? = null,
+    /** Set for a track-intervals session; [step] / [stepNo] say which interval it's in. */
+    val intervals: Intervals? = null,
     val savedFile: String? = null,
 )
 
@@ -121,9 +123,10 @@ class ExerciseService : LifecycleService() {
     }
 
     private fun start(intent: Intent) {
-        if (RunRepo.state.value.status in setOf(Status.STARTING, Status.ACTIVE, Status.PAUSED, Status.AUTO_PAUSED)) return
+        if (RunRepo.state.value.status in setOf(Status.STARTING, Status.ACTIVE, Status.PAUSED)) return
         cfg = Config.load(this)
-        workout = cfg.workouts.firstOrNull { it.name == intent.getStringExtra(EXTRA_WORKOUT) }
+        val intervals = if (intent.getBooleanExtra(EXTRA_INTERVALS, false)) Intervals.load(this) else null
+        workout = intervals?.workout() ?: cfg.workouts.firstOrNull { it.name == intent.getStringExtra(EXTRA_WORKOUT) }
         val race = cfg.races.firstOrNull { it.name == intent.getStringExtra(EXTRA_RACE) }
         val pacerFast = intent.getDoubleExtra(EXTRA_PACER_FAST, 0.0).takeIf { it > 0 }
         val pacerSlow = intent.getDoubleExtra(EXTRA_PACER_SLOW, 0.0).takeIf { it > 0 }
@@ -138,6 +141,7 @@ class ExerciseService : LifecycleService() {
             step = workout?.steps?.firstOrNull(),
             stepCount = workout?.steps?.size ?: 0,
             race = race,
+            intervals = intervals,
         )
         ServiceCompat.startForeground(
             this, 1, notification(),
@@ -163,7 +167,8 @@ class ExerciseService : LifecycleService() {
             client.startExerciseAsync(
                 ExerciseConfig.builder(ExerciseType.RUNNING)
                     .setDataTypes(wanted intersect caps.supportedDataTypes)
-                    .setIsAutoPauseAndResumeEnabled(cfg.autoPause && caps.supportsAutoPauseAndResume)
+                    // Pausing is always by hand (the crown); never automatic.
+                    .setIsAutoPauseAndResumeEnabled(false)
                     .setIsGpsEnabled(true)
                     .build()
             ).await()
@@ -185,13 +190,16 @@ class ExerciseService : LifecycleService() {
         // Killed during warm-up: nothing was recorded.
         if (r.events.none { it.type == "START" }) { journal.delete(); stopSelf(); return }
         rec = r
-        workout = cfg.workouts.firstOrNull { it.name == info.workout }
+        // Intervals aren't in config.json; the setup they started with is still in prefs.
+        val intervals = if (info.workout == Intervals.NAME) Intervals.load(this) else null
+        workout = intervals?.workout() ?: cfg.workouts.firstOrNull { it.name == info.workout }
         lapStartWall = info.lapEndWall; lapStartActive = info.lapEndActive; lapStartMeters = info.lapEndMeters
         stepIdx = info.stepIdx; stepStartActive = info.stepStartActive; stepStartMeters = info.stepStartMeters
         RunRepo.state.value = RunState(
             status = Status.ACTIVE, mode = info.mode,
             step = workout?.steps?.getOrNull(stepIdx), stepNo = stepIdx, stepCount = workout?.steps?.size ?: 0,
             race = cfg.races.firstOrNull { it.name == info.race }, meters = info.lapEndMeters,
+            intervals = intervals,
         )
         ServiceCompat.startForeground(
             this, 1, notification(),
@@ -244,7 +252,6 @@ class ExerciseService : LifecycleService() {
         val status = when (u.exerciseStateInfo.state) {
             ExerciseState.ACTIVE -> Status.ACTIVE
             ExerciseState.USER_PAUSED -> Status.PAUSED
-            ExerciseState.AUTO_PAUSED -> Status.AUTO_PAUSED
             ExerciseState.ENDED -> Status.ENDED
             else -> prev
         }
@@ -263,9 +270,7 @@ class ExerciseService : LifecycleService() {
                 buzz(LONG)
             }
             now == Status.PAUSED -> { rec.addEvent("PAUSE"); buzz(SHORT) }
-            now == Status.AUTO_PAUSED -> { rec.addEvent("AUTO_PAUSE"); buzz(SHORT) }
             prev == Status.PAUSED && now == Status.ACTIVE -> { rec.addEvent("RESUME"); buzz(SHORT) }
-            prev == Status.AUTO_PAUSED && now == Status.ACTIVE -> { rec.addEvent("AUTO_RESUME"); buzz(SHORT) }
             now == Status.ENDED -> finish()
         }
     }
@@ -287,7 +292,7 @@ class ExerciseService : LifecycleService() {
                 val step = wo.steps[stepIdx]
                 val done = (step.meters != null && s.meters - stepStartMeters >= step.meters) ||
                     (step.seconds != null && act - stepStartActive >= step.seconds * 1000)
-                if (done) advanceStep("DISTANCE") else checkPace(step, pace, act)
+                if (done) advanceStep(if (step.meters != null) "DISTANCE" else "TIME") else checkPace(step, pace, act)
             } else if (wo == null && s.meters - lapStartMeters >= cfg.autoLapMeters) {
                 lap("DISTANCE")
             }
@@ -347,13 +352,23 @@ class ExerciseService : LifecycleService() {
         stepStartMeters = RunRepo.state.value.meters
         rec.logStep(stepIdx, stepStartActive, stepStartMeters)
         offTargetSince = 0
-        buzz(if (stepIdx >= wo.steps.size) TRIPLE else LONG)
+        val iv = RunRepo.state.value.intervals
+        buzz(when {
+            iv == null -> if (stepIdx >= wo.steps.size) TRIPLE else LONG
+            iv.kind(stepIdx) == Intervals.Kind.ON -> LONG
+            iv.kind(stepIdx) == Intervals.Kind.REST -> DOUBLE
+            else -> TRIPLE
+        })
         update { it.copy(step = wo.steps.getOrNull(stepIdx), stepNo = stepIdx, paceFlag = 0) }
     }
 
     private fun lap(trigger: String, fromStep: Boolean = false) {
         val s = RunRepo.state.value
-        if (s.status !in setOf(Status.ACTIVE, Status.PAUSED, Status.AUTO_PAUSED)) return
+        if (s.status !in setOf(Status.ACTIVE, Status.PAUSED)) return
+        // In intervals, crown up only moves on from an open interval, and cool down is the last one.
+        s.intervals?.let { iv ->
+            if (!fromStep && (s.step?.untilLap != true || iv.isLast(stepIdx))) return
+        }
         // In a workout, the lap button ends a lap-terminated step.
         if (!fromStep && workout?.steps?.getOrNull(stepIdx)?.untilLap == true) return advanceStep(trigger)
         val now = System.currentTimeMillis()
@@ -435,6 +450,8 @@ class ExerciseService : LifecycleService() {
         const val ACTION_END = "end"
         const val EXTRA_WORKOUT = "workout"
         const val EXTRA_RACE = "race"
+        /** Start the intervals saved by [Intervals.save]. */
+        const val EXTRA_INTERVALS = "intervals"
         const val EXTRA_PACER_FAST = "pacerFast"
         const val EXTRA_PACER_SLOW = "pacerSlow"
         private const val PACER_GRACE_MS = 30_000L

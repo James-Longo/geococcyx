@@ -83,18 +83,17 @@ import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
 import com.jameslongo.geococcyx.Config
 import com.jameslongo.geococcyx.ExerciseService
+import com.jameslongo.geococcyx.Intervals
 import com.jameslongo.geococcyx.MainActivity
 import com.jameslongo.geococcyx.RunRepo
 import com.jameslongo.geococcyx.RunState
 import com.jameslongo.geococcyx.Status
-import com.jameslongo.geococcyx.SyncWorker
 import com.jameslongo.geococcyx.field
 import com.jameslongo.geococcyx.fmtDist
 import com.jameslongo.geococcyx.fmtDur
 import com.jameslongo.geococcyx.fmtPace
-import java.io.File
 
-private enum class Menu { HOME, PACER, WORKOUTS, RACES, RUNS }
+private enum class Menu { HOME, INTERVALS, PACER }
 
 @Composable
 fun App(act: MainActivity) {
@@ -110,34 +109,27 @@ fun App(act: MainActivity) {
     MaterialTheme {
         Box(Modifier.fillMaxSize().background(Color.Black)) {
             when (s.status) {
-                Status.STARTING, Status.ACTIVE, Status.PAUSED, Status.AUTO_PAUSED ->
+                Status.STARTING, Status.ACTIVE, Status.PAUSED ->
                     RunScreen(act, s, cfg, act.ambient.value)
                 Status.ENDED -> Summary(s, cfg) { RunRepo.state.value = RunState(); cfg = Config.load(act) }
                 Status.IDLE -> {
                     BackHandler(menu != Menu.HOME) { menu = Menu.HOME }
-                    fun start(workout: String? = null, race: String? = null, pacer: Pair<Double, Double>? = null) {
+                    fun start(intervals: Boolean = false, pacer: Pair<Double, Double>? = null) {
                         if (missing.isNotEmpty()) { ask.launch(missing); return }
                         ExerciseService.send(act, ExerciseService.ACTION_START) {
-                            workout?.let { putExtra(ExerciseService.EXTRA_WORKOUT, it) }
-                            race?.let { putExtra(ExerciseService.EXTRA_RACE, it) }
+                            if (intervals) putExtra(ExerciseService.EXTRA_INTERVALS, true)
                             pacer?.let { putExtra(ExerciseService.EXTRA_PACER_FAST, it.first); putExtra(ExerciseService.EXTRA_PACER_SLOW, it.second) }
                         }
                     }
                     when (menu) {
                         Menu.HOME -> ChipList(stringResource(R.string.app_name), buildList {
                             add("Run" to { start() })
+                            add("Intervals ›" to { menu = Menu.INTERVALS })
                             add("Pacer ›" to { menu = Menu.PACER })
-                            if (cfg.workouts.isNotEmpty()) add("Workout ›" to { menu = Menu.WORKOUTS })
-                            if (cfg.races.isNotEmpty()) add("Race ›" to { menu = Menu.RACES })
-                            add("Runs & sync ›" to { menu = Menu.RUNS })
                             if (missing.isNotEmpty()) add("Grant permissions" to { ask.launch(missing) })
                         })
                         Menu.PACER -> PacerSetup(act, cfg) { fast, slow -> menu = Menu.HOME; start(pacer = fast to slow) }
-                        Menu.WORKOUTS -> ChipList("Workouts", cfg.workouts.map { w -> w.name to { start(workout = w.name) } })
-                        Menu.RACES -> ChipList("Races", cfg.races.map { r ->
-                            "${r.name} · ${fmtDur((r.targetSec * 1000).toLong())}" to { start(race = r.name) }
-                        })
-                        Menu.RUNS -> Runs(act, cfg)
+                        Menu.INTERVALS -> IntervalsSetup(act) { menu = Menu.HOME; start(intervals = true) }
                     }
                 }
             }
@@ -172,15 +164,16 @@ private fun RunScreen(act: MainActivity, s: RunState, cfg: Config, ambient: Bool
     }
     // One data screen; touches (sweat, rain, a sleeve) do nothing. The crown twist pauses and resumes.
     // While paused, holding the screen for END_HOLD_MS ends the run, with a ring filling around the edge.
-    val canEnd = s.status == Status.PAUSED || s.status == Status.AUTO_PAUSED
+    val canEnd = s.status == Status.PAUSED
     val hold = remember { Animatable(0f) }
     val scope = rememberCoroutineScope()
     var holdJob by remember { mutableStateOf<Job?>(null) }
     val haptic = LocalHapticFeedback.current
     // A lap just closed or the pacer fired: it fills the screen for a few seconds (the newer one wins).
     var flash by remember { mutableStateOf(false) }
+    val iv = s.intervals
     LaunchedEffect(s.lastLapAt) {
-        val left = (s.lastLapAt ?: 0) + LAP_FLASH_MS - System.currentTimeMillis()
+        val left = (s.lastLapAt ?: 0) + (if (iv != null) REP_FLASH_MS else LAP_FLASH_MS) - System.currentTimeMillis()
         if (left > 0) { flash = true; kotlinx.coroutines.delay(left); flash = false }
     }
     var pacerFlash by remember { mutableStateOf(false) }
@@ -210,6 +203,13 @@ private fun RunScreen(act: MainActivity, s: RunState, cfg: Config, ambient: Bool
         },
     ) {
         when {
+            iv != null -> when {
+                ambient -> IntervalPage(s, iv, dim = true)
+                canEnd -> IntervalPausedPage(s, iv)
+                // Only an ON rep closing shows its time: going into a rest or the cool down.
+                flash && iv.kind(s.stepNo) in setOf(Intervals.Kind.REST, Intervals.Kind.COOL_DOWN) -> RepFlash(s, iv)
+                else -> IntervalPage(s, iv, dim = false)
+            }
             pacerOnTop -> PacerFlash(s, cfg)
             flash -> LapFlash(s, cfg)
             ambient -> DataPage(cfg.fields, s, cfg, dim = true)
@@ -219,7 +219,7 @@ private fun RunScreen(act: MainActivity, s: RunState, cfg: Config, ambient: Bool
             s.race != null -> RacePage(s, cfg)
             else -> DataPage(cfg.fields, s, cfg, dim = false)
         }
-        if (canEnd && !ambient && !flash && !pacerFlash) {
+        if (canEnd && !ambient && (iv != null || (!flash && !pacerFlash))) {
             val dx = rememberDx()
             Canvas(Modifier.fillMaxSize()) {
                 val w = dx.dp(12).toPx()
@@ -234,6 +234,7 @@ private fun RunScreen(act: MainActivity, s: RunState, cfg: Config, ambient: Bool
 
 private const val END_HOLD_MS = 3000
 private const val LAP_FLASH_MS = 5000L
+private const val REP_FLASH_MS = 10_000L
 private const val PACER_FLASH_MS = 3000L
 private val TOO_FAST_BG = Color(0xFF3AD1F2)
 private val TOO_SLOW_BG = Color(0xFFFF7A1A)
@@ -319,6 +320,137 @@ private fun StepButton(dx: Dx, sign: String, onClick: () -> Unit) = Box(
     contentAlignment = Alignment.Center,
 ) { Text(sign, style = number(dx, 40, Color.White)) }
 
+/**
+ * Intervals setup: tap REPS, ON or REST to pick it, then turn the crown to set it. ON and REST go
+ * in 15 s steps; below 0:15 they're OPEN (move on with the crown). The last setup is remembered.
+ */
+@Composable
+private fun IntervalsSetup(act: MainActivity, start: () -> Unit) {
+    val dx = rememberDx()
+    val saved = remember { Intervals.load(act) }
+    var reps by remember { mutableIntStateOf(saved.reps) }
+    var on by remember { mutableIntStateOf(saved.onSec) }
+    var rest by remember { mutableIntStateOf(saved.restSec) }
+    var editing by remember { mutableIntStateOf(0) }
+    fun step(by: Int) = when (editing) {
+        0 -> reps = (reps + by).coerceIn(1, 30)
+        1 -> on = (on + 15 * by).coerceIn(0, 1200)
+        else -> rest = (rest + 15 * by).coerceIn(0, 1200)
+    }
+    val focus = remember { FocusRequester() }
+    var scrolled by remember { mutableStateOf(0f) }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    Column(
+        Modifier.fillMaxSize().onRotaryScrollEvent {
+            scrolled += it.verticalScrollPixels
+            while (scrolled > PACER_CROWN_PX) { step(1); scrolled -= PACER_CROWN_PX }
+            while (scrolled < -PACER_CROWN_PX) { step(-1); scrolled += PACER_CROWN_PX }
+            true
+        }.focusRequester(focus).focusable(),
+        verticalArrangement = Arrangement.spacedBy(dx.dp(8), Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("INTERVALS", style = label(dx, 14, ACCENT, spacing = 0.18f))
+        SetupRow(dx, "REPS", reps.toString(), editing == 0) { editing = 0 }
+        SetupRow(dx, "ON", fmtOpen(on), editing == 1) { editing = 1 }
+        SetupRow(dx, "REST", fmtOpen(rest), editing == 2) { editing = 2 }
+        Box(
+            Modifier.padding(top = dx.dp(6)).size(dx.dp(200), dx.dp(64)).clip(RoundedCornerShape(dx.dp(10))).background(ACCENT).clickable {
+                Intervals(reps, on, rest).save(act)
+                start()
+            },
+            contentAlignment = Alignment.Center,
+        ) { Text("START", style = label(dx, 22, Color.Black, spacing = 0.1f)) }
+    }
+}
+
+private fun fmtOpen(sec: Int) = if (sec == 0) "OPEN" else "%d:%02d".format(sec / 60, sec % 60)
+
+@Composable
+private fun SetupRow(dx: Dx, name: String, value: String, selected: Boolean, select: () -> Unit) {
+    val open = value == "OPEN"
+    Row(
+        Modifier.size(dx.dp(290), dx.dp(66)).clip(RoundedCornerShape(dx.dp(12)))
+            .border(dx.dp(2), if (selected) ACCENT else Color(0xFF262626), RoundedCornerShape(dx.dp(12)))
+            .clickable(onClick = select).padding(horizontal = dx.dp(18)),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(name, style = label(dx, 14, if (selected) ACCENT else GRAY))
+        Text(
+            value,
+            style = if (open) number(dx, 30, Color(0xFF6A6A6A)) else number(dx, 46, if (selected) ACCENT else Color.White),
+        )
+    }
+}
+
+/**
+ * One interval: its time counting up dead center, its name just above. ON fills the screen with
+ * the accent so it reads at a glance; a REST says how many reps are left. A timed interval
+ * fills a ring around the edge as it goes.
+ */
+@Composable
+private fun IntervalPage(s: RunState, iv: Intervals, dim: Boolean) {
+    val dx = rememberDx()
+    val kind = iv.kind(s.stepNo)
+    val on = kind == Intervals.Kind.ON && !dim
+    val time = fmtDur(s.stepMs)
+    val fg = when { dim -> GRAY; on -> Color.Black; else -> Color.White }
+    val lc = when { dim -> GRAY; on -> Color.Black; kind == Intervals.Kind.REST -> ACCENT; else -> Color.White }
+    Box(Modifier.fillMaxSize().background(if (on) ACCENT else Color.Black), contentAlignment = Alignment.Center) {
+        Text(time, style = number(dx, fit(time, 150, 4), fg))
+        Text(
+            kind.label, style = label(dx, if (kind.label.length <= 4) 44 else 40, lc, spacing = 0.14f),
+            modifier = Modifier.offset(y = -dx.dp(102)),
+        )
+        if (kind == Intervals.Kind.REST) {
+            Text(
+                "${iv.repsLeft(s.stepNo)} MORE", style = label(dx, 30, if (dim) GRAY else Color(0xFFBDBDBD), spacing = 0.12f),
+                modifier = Modifier.offset(y = dx.dp(96)),
+            )
+        }
+        val sec = s.step?.seconds
+        if (sec != null && !dim) {
+            val done = (s.stepMs / (sec * 1000)).toFloat().coerceIn(0f, 1f)
+            Canvas(Modifier.fillMaxSize()) {
+                val w = dx.dp(13).toPx()
+                val tl = Offset(w / 2, w / 2)
+                val sz = Size(size.width - w, size.height - w)
+                drawArc(if (on) Color.Black.copy(alpha = 0.15f) else Color(0xFF262626), 0f, 360f, false, tl, sz, style = Stroke(w))
+                drawArc(if (on) Color.Black else ACCENT, -90f, 360f * done, false, tl, sz, style = Stroke(w))
+            }
+        }
+    }
+}
+
+/** Paused in intervals: the interval's time stays centered; hold anywhere to end. */
+@Composable
+private fun IntervalPausedPage(s: RunState, iv: Intervals) {
+    val dx = rememberDx()
+    val time = fmtDur(s.stepMs)
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Box(
+            Modifier.align(Alignment.TopCenter).fillMaxWidth().height(dx.dp(112)).background(ACCENT).padding(bottom = dx.dp(10)),
+            contentAlignment = Alignment.BottomCenter,
+        ) { Text("PAUSED", style = label(dx, 28, Color.Black, spacing = 0.18f)) }
+        Text(time, style = number(dx, fit(time, 120, 4), Color.White))
+        Text(iv.kind(s.stepNo).label, style = label(dx, 22, Color(0xFFBDBDBD)), modifier = Modifier.offset(y = dx.dp(80)))
+        Text("HOLD TO END", style = label(dx, 14, Color.White, spacing = 0.14f), modifier = Modifier.offset(y = dx.dp(122)))
+    }
+}
+
+/** A rep just ended: its time on white for the first [REP_FLASH_MS] of the rest. */
+@Composable
+private fun RepFlash(s: RunState, iv: Intervals) {
+    val dx = rememberDx()
+    val time = fmtDur(s.lastLapMs ?: 0)
+    val next = if (iv.kind(s.stepNo) == Intervals.Kind.REST) "REST · ${iv.repsLeft(s.stepNo)} MORE" else "COOL DOWN"
+    Box(Modifier.fillMaxSize().background(Color.White), contentAlignment = Alignment.Center) {
+        Text(time, style = number(dx, fit(time, 128, 4), Color.Black))
+        Text("REP ${iv.rep(s.stepNo)}", style = label(dx, 26, Color.Black, spacing = 0.2f), modifier = Modifier.offset(y = -dx.dp(78)))
+        Text(next, style = label(dx, 24, Color(0xFF444444), spacing = 0.12f), modifier = Modifier.offset(y = dx.dp(78)))
+    }
+}
+
 /** Full screen before the run: gray while GPS searches, then the whole screen is the start button. */
 @Composable
 private fun ReadyPage(gpsReady: Boolean, go: () -> Unit) {
@@ -403,7 +535,7 @@ private fun PausedPage(s: RunState, cfg: Config) {
     val time = fmtDur(s.activeMs)
     Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
         Box(Modifier.fillMaxWidth().height(dx.dp(142)).background(ACCENT).padding(bottom = dx.dp(10)), contentAlignment = Alignment.BottomCenter) {
-            Text(if (s.status == Status.AUTO_PAUSED) "AUTO-PAUSED" else "PAUSED", style = label(dx, 30, Color.Black, spacing = 0.18f))
+            Text("PAUSED", style = label(dx, 30, Color.Black, spacing = 0.18f))
         }
         Spacer(Modifier.height(dx.dp(14)))
         Text(time, style = number(dx, fit(time, 100, 5), Color.White))
@@ -495,35 +627,6 @@ private fun Summary(s: RunState, cfg: Config, done: () -> Unit) {
 }
 
 @Composable
-private fun Runs(act: MainActivity, cfg: Config) {
-    val dir = File(act.filesDir, "runs")
-    val runs = dir.listFiles { f -> f.name.endsWith(".tcx") }.orEmpty().sortedByDescending { it.name }.take(20)
-    val log = File(act.filesDir, "sync.log").takeIf { it.exists() }?.readLines()?.lastOrNull()
-    ScalingLazyColumn(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-        item { Text("Runs", color = ACCENT, fontWeight = FontWeight.Bold) }
-        item {
-            Chip(label = { Text("Sync now") }, onClick = { SyncWorker.enqueue(act) },
-                colors = ChipDefaults.secondaryChipColors())
-        }
-        items(runs) { f ->
-            val base = f.path.removeSuffix(".tcx")
-            // Only the services config.json signs in to; ✓ uploaded, … waiting.
-            val st = listOfNotNull(
-                "Strava".takeIf { cfg.strava != null }?.let { it to "strava" },
-                "Drive".takeIf { cfg.google != null && cfg.drive }?.let { it to "drive" },
-                "Health".takeIf { cfg.google != null && cfg.googleHealth }?.let { it to "google" },
-            ).joinToString("  ") { (label, ext) -> label + if (File("$base.$ext").exists()) " ✓" else " …" }.ifEmpty { "Not uploading" }
-            // Read-only: runs can't be deleted on the watch.
-            Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
-                Text(f.name.take(15).replace("T", " "), fontSize = 12.sp, color = Color.White)
-                Text(st, color = Color.Gray, fontSize = 11.sp)
-            }
-        }
-        log?.let { item { Text(it.takeLast(120), color = Color(0xFFE57373), fontSize = 10.sp) } }
-    }
-}
-
-@Composable
 private fun Center(title: String, sub: String) {
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
         Text(title, fontSize = 22.sp, color = Color.White)
@@ -533,6 +636,7 @@ private fun Center(title: String, sub: String) {
 
 private val ACCENT = Color(0xFFC8F23A)
 private val LINE = Color(0xFF3A3A3A)
+private val GRAY = Color(0xFF9A9A9A)
 private val CHIVO = FontFamily(Font(R.font.chivo_extrabold, FontWeight.ExtraBold))
 private val CHIVO_MONO = FontFamily(Font(R.font.chivo_mono_bold, FontWeight.Bold), Font(R.font.chivo_mono_medium, FontWeight.Medium))
 

@@ -49,23 +49,33 @@ class MainActivity : ComponentActivity() {
     /**
      * Pixel Watch keeps both button presses for the system, so a firm twist of the crown
      * pauses or resumes instead: [TWIST_PX] of turning within [TWIST_WINDOW_MS] of starting to turn.
+     * In intervals the direction matters: up moves on from an open interval (or resumes when
+     * paused), down pauses.
      */
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
-        val st = RunRepo.flow.value.status
-        val running = st == Status.ACTIVE || st == Status.PAUSED || st == Status.AUTO_PAUSED
+        val s = RunRepo.flow.value
+        val st = s.status
+        val running = st == Status.ACTIVE || st == Status.PAUSED
         if (!running || ev.action != MotionEvent.ACTION_SCROLL || !ev.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER)) {
             return super.dispatchGenericMotionEvent(ev)
         }
-        val px = -ev.getAxisValue(MotionEvent.AXIS_SCROLL) *
+        // AXIS_SCROLL is positive for scrolling up (counter-clockwise on the crown).
+        val px = ev.getAxisValue(MotionEvent.AXIS_SCROLL) *
             ViewConfigurationCompat.getScaledVerticalScrollFactor(android.view.ViewConfiguration.get(this), this)
         val now = ev.eventTime
         // Only turning packed into TWIST_WINDOW_MS counts, so a slow roll never adds up to a pause.
         if (now - twistAt > TWIST_WINDOW_MS) { twistAt = now; twistPx = 0f }
-        twistPx += kotlin.math.abs(px)
-        if (twistPx >= TWIST_PX && now - lastToggle > TWIST_COOLDOWN_MS) {
+        twistPx += if (s.intervals != null) px else kotlin.math.abs(px)
+        if (kotlin.math.abs(twistPx) >= TWIST_PX && now - lastToggle > TWIST_COOLDOWN_MS) {
+            val up = twistPx > 0
             twistPx = 0f
             lastToggle = now
-            ExerciseService.send(this, if (st == Status.ACTIVE) ExerciseService.ACTION_PAUSE else ExerciseService.ACTION_RESUME)
+            val action = when {
+                s.intervals == null -> if (st == Status.ACTIVE) ExerciseService.ACTION_PAUSE else ExerciseService.ACTION_RESUME
+                st != Status.ACTIVE -> if (up) ExerciseService.ACTION_RESUME else null
+                else -> if (up) ExerciseService.ACTION_LAP else ExerciseService.ACTION_PAUSE
+            }
+            action?.let { ExerciseService.send(this, it) }
         }
         return true
     }
@@ -75,7 +85,7 @@ class MainActivity : ComponentActivity() {
         val stem = keyCode == KeyEvent.KEYCODE_STEM_PRIMARY || keyCode == KeyEvent.KEYCODE_STEM_1 ||
             keyCode == KeyEvent.KEYCODE_STEM_2 || keyCode == KeyEvent.KEYCODE_STEM_3
         val st = RunRepo.flow.value.status
-        if (stem && (st == Status.ACTIVE || st == Status.PAUSED || st == Status.AUTO_PAUSED)) {
+        if (stem && (st == Status.ACTIVE || st == Status.PAUSED)) {
             ExerciseService.send(this, ExerciseService.ACTION_LAP)
             return true
         }

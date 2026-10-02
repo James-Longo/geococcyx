@@ -7,3 +7,4 @@ strava-client.json
 google-client.json
 run-backups/
 __pycache__/
+watch-files/

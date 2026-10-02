@@ -104,18 +104,18 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
         return best?.second
     }
 
-    /** Wall-clock spans when the run was paused (manual or auto). */
+    /** Wall-clock spans when the run was paused. */
     private fun pauses(): List<LongRange> {
         val out = ArrayList<LongRange>()
         var from: Long? = null
         for (e in events) when (e.type) {
-            "PAUSE", "AUTO_PAUSE" -> if (from == null) from = e.t
-            "RESUME", "AUTO_RESUME", "STOP" -> from?.let { out += it..e.t; from = null }
+            "PAUSE" -> if (from == null) from = e.t
+            "RESUME", "STOP" -> from?.let { out += it..e.t; from = null }
         }
         return out
     }
 
-    /** TCX with one Lap per lap and a new Track after every pause, so Strava sees real stops only. */
+    /** TCX with one Lap per lap and a new Track after every pause, so Strava (via Drive) sees real stops only. */
     fun toTcx(): String {
         val pauses = pauses()
         val sb = StringBuilder()
@@ -127,7 +127,7 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
             sb.append("<Lap StartTime=\"${iso(lap.start)}\"><TotalTimeSeconds>${lap.activeMs / 1000.0}</TotalTimeSeconds>")
             sb.append("<DistanceMeters>${"%.1f".format(lap.meters)}</DistanceMeters><Calories>0</Calories>")
             lap.avgHr?.let { sb.append("<AverageHeartRateBpm><Value>$it</Value></AverageHeartRateBpm>") }
-            sb.append("<Intensity>Active</Intensity><TriggerMethod>${if (lap.trigger == "MANUAL") "Manual" else "Distance"}</TriggerMethod>\n<Track>\n")
+            sb.append("<Intensity>Active</Intensity><TriggerMethod>${when (lap.trigger) { "MANUAL" -> "Manual"; "TIME" -> "Time"; else -> "Distance" }}</TriggerMethod>\n<Track>\n")
             var prev: Loc? = null
             for (l in locs) {
                 if (l.t < lap.start || l.t > lap.end) continue
@@ -179,7 +179,7 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
             }))
             .put("splitSummaries", JSONArray(laps.map { lap ->
                 interval(lap.start, lap.end)
-                    .put("splitType", if (lap.trigger == "MANUAL") "MANUAL" else "DISTANCE")
+                    .put("splitType", if (lap.trigger == "DISTANCE") "DISTANCE" else "MANUAL")
                     .put("metricsSummary", JSONObject().put("distanceMillimeters", lap.meters * 1000).apply {
                         lap.avgHr?.let { put("averageHeartRateBeatsPerMinute", it.toString()) }
                     })

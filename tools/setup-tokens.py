@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""setup-tokens.py — one-time sign-in to Strava and Google Health for the watch.
+"""setup-tokens.py — one-time Google sign-in (Drive and Health) for the watch.
 
 Writes ../config.json: tools/config.example.json settings (or the existing
 config.json) plus the credentials the watch needs to upload runs.
 
-  python3 tools/setup-tokens.py strava   # needs ../strava-client.json {"client_id","client_secret"} (gitignored)
   python3 tools/setup-tokens.py google   # needs ../google-client.json, a Google OAuth desktop client (gitignored)
 """
 import http.server
@@ -18,7 +17,6 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONFIG = os.path.join(ROOT, "config.json")
-STRAVA_CLIENT = os.path.join(ROOT, "strava-client.json")
 GOOGLE_CLIENT = os.path.join(ROOT, "google-client.json")
 # Drive: only files this app creates (its run folder). Health: write workouts.
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive.file",
@@ -62,21 +60,6 @@ def wait_for_code(url_for):
     return got["code"][0], f"http://127.0.0.1:{srv.server_port}"
 
 
-def strava():
-    c = json.load(open(STRAVA_CLIENT))
-    code, _ = wait_for_code(lambda redirect: "https://www.strava.com/oauth/authorize?" + urllib.parse.urlencode({
-        "client_id": c["client_id"], "redirect_uri": redirect, "response_type": "code",
-        "approval_prompt": "force", "scope": "activity:write,activity:read_all"}))
-    tok = json.load(urllib.request.urlopen(urllib.request.Request(
-        "https://www.strava.com/oauth/token", urllib.parse.urlencode({
-            "client_id": c["client_id"], "client_secret": c["client_secret"],
-            "code": code, "grant_type": "authorization_code"}).encode())))
-    cfg = load_config()
-    cfg["strava"] = {"clientId": str(c["client_id"]), "clientSecret": c["client_secret"],
-                     "refreshToken": tok["refresh_token"]}
-    save_config(cfg)
-
-
 def google():
     # The client file as Google Cloud downloads it: {"installed": {...}} (or "web").
     client = next(iter(json.load(open(GOOGLE_CLIENT)).values()))
@@ -93,4 +76,4 @@ def google():
     save_config(cfg)
 
 if __name__ == "__main__":
-    {"strava": strava, "google": google}.get(sys.argv[1] if len(sys.argv) > 1 else "", lambda: sys.exit(__doc__))()
+    {"google": google}.get(sys.argv[1] if len(sys.argv) > 1 else "", lambda: sys.exit(__doc__))()

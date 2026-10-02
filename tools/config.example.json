@@ -1,7 +1,6 @@
 {
   "units": "mi",
   "autoLapMeters": 1609.344,
-  "autoPause": false,
   "drive": true,
   "googleHealth": false,
   "fields": ["distance", "lapPace", "avgPace", "time"],
