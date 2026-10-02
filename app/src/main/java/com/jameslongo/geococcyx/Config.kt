@@ -15,9 +15,8 @@ data class Config(
     val workouts: List<Workout>,
     val races: List<Race>,
     val google: Creds?,
-    /** With [google] signed in: copy each saved run's TCX to Drive, and/or post its summary to Google Health. */
+    /** With [google] signed in: copy each saved run's TCX to Drive. */
     val drive: Boolean,
-    val googleHealth: Boolean,
 ) {
     companion object {
         private val DEFAULT_FIELDS = listOf("distance", "lapPace", "avgPace", "time")
@@ -39,7 +38,6 @@ data class Config(
                 races = j.optJSONArray("races").objects().map { Race.parse(it) },
                 google = j.optJSONObject("google")?.let(Creds::parse),
                 drive = j.optBoolean("drive", true),
-                googleHealth = j.optBoolean("googleHealth", false),
             )
         }
     }

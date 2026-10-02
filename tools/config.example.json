@@ -2,7 +2,6 @@
   "units": "mi",
   "autoLapMeters": 1609.344,
   "drive": true,
-  "googleHealth": false,
   "fields": ["distance", "lapPace", "avgPace", "time"],
   "workouts": [
     {"name": "6x800", "steps": [

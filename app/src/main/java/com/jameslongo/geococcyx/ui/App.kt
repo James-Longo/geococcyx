@@ -618,7 +618,7 @@ private fun Summary(s: RunState, cfg: Config, done: () -> Unit) {
             Divider(dx)
         }
         Spacer(Modifier.height(dx.dp(10)))
-        // The run is already saved and syncing; runs are never deleted on the watch (do that in Drive).
+        // The run is already saved and syncing; the watch deletes it after 30 days once uploaded.
         Box(
             Modifier.size(dx.dp(200), dx.dp(72)).clip(RoundedCornerShape(dx.dp(10))).background(ACCENT).clickable(onClick = done),
             contentAlignment = Alignment.Center,

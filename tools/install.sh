@@ -11,6 +11,7 @@ adb="$ANDROID_HOME/platform-tools/adb"
 ./gradlew -q assembleDebug
 "$adb" install -r app/build/outputs/apk/debug/app-debug.apk
 if [[ -f config.json ]]; then
-  "$adb" shell "run-as com.jameslongo.geococcyx sh -c 'mkdir -p files && cat > files/config.json'" < config.json
+  # Write to a temp file and move it into place, so a dropped connection never leaves an empty config.
+  "$adb" shell "run-as com.jameslongo.geococcyx sh -c 'mkdir -p files && cat > files/config.json.tmp && [ -s files/config.json.tmp ] && mv files/config.json.tmp files/config.json'" < config.json
   echo "config.json pushed"
 fi

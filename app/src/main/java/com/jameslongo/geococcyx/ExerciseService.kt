@@ -389,12 +389,11 @@ class ExerciseService : LifecycleService() {
         }
         val base = File(File(filesDir, "runs"), Recorder.iso(rec.start).replace(":", ""))
         File("$base.tcx").writeText(rec.toTcx())
-        File("$base.health.json").writeText(rec.toGoogleHealth(s.mode, cpActive, s.meters).toString())
         File("$base.meta.json").writeText(org.json.JSONObject().put("name", s.mode).put("activeMs", cpActive).put("meters", s.meters)
             // Start time and the watch's (network-set) time zone, so the run is named in local time wherever it uploads.
             .put("start", rec.start).put("tz", java.util.TimeZone.getDefault().id).toString())
         File(File(filesDir, "runs"), "current.journal").delete()
-        // Every finished run is kept and uploaded; nothing on the watch deletes runs.
+        // Every finished run is uploaded; SyncWorker deletes it from the watch after 30 days.
         SyncWorker.enqueue(this)
         buzz(LONG)
         update { it.copy(status = Status.ENDED, activeMs = cpActive, savedFile = base.name) }

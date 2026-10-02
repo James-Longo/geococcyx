@@ -1,10 +1,7 @@
 package com.jameslongo.geococcyx
 
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
 import java.time.Instant
-import java.util.TimeZone
 
 data class Loc(val t: Long, val lat: Double, val lon: Double, val alt: Double?)
 data class Lap(
@@ -159,38 +156,6 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
         return sb.toString()
     }
 
-    /** Body for POST /v4/users/me/dataTypes/exercise/dataPoints (Google Health API). */
-    fun toGoogleHealth(name: String, activeMs: Long, meters: Double): JSONObject {
-        val end = events.lastOrNull { it.type == "STOP" }?.t ?: System.currentTimeMillis()
-        val avg = avgHr(start, end)
-        val summary = JSONObject().put("distanceMillimeters", meters * 1000)
-        if (meters > 0) summary.put("averagePaceSecondsPerMeter", activeMs / 1000.0 / meters)
-        avg?.let { summary.put("averageHeartRateBeatsPerMinute", it.toString()) }
-        val ex = JSONObject()
-            .put("interval", interval(start, end))
-            .put("exerciseType", "RUNNING")
-            .put("displayName", name)
-            .put("activeDuration", "${activeMs / 1000.0}s")
-            .put("metricsSummary", summary)
-            .put("exerciseMetadata", JSONObject().put("hasGps", locs.isNotEmpty()))
-            .put("exerciseEvents", JSONArray(events.map {
-                JSONObject().put("eventTime", iso(it.t)).put("eventUtcOffset", offset(it.t))
-                    .put("exerciseEventType", it.type)
-            }))
-            .put("splitSummaries", JSONArray(laps.map { lap ->
-                interval(lap.start, lap.end)
-                    .put("splitType", if (lap.trigger == "DISTANCE") "DISTANCE" else "MANUAL")
-                    .put("metricsSummary", JSONObject().put("distanceMillimeters", lap.meters * 1000).apply {
-                        lap.avgHr?.let { put("averageHeartRateBeatsPerMinute", it.toString()) }
-                    })
-            }))
-        return JSONObject().put("exercise", ex)
-    }
-
-    private fun interval(a: Long, b: Long) = JSONObject()
-        .put("startTime", iso(a)).put("startUtcOffset", offset(a))
-        .put("endTime", iso(b)).put("endUtcOffset", offset(b))
-
     companion object {
         /** Namespace for TCX values Garmin's schema has no element for (stride length). */
         const val NS = "urn:geococcyx:tcx:v1"
@@ -234,6 +199,5 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
         fun altitude(m: Double): Double? = m.takeIf { it.isFinite() && it in -500.0..9000.0 }
 
         fun iso(t: Long): String = Instant.ofEpochMilli(t).toString()
-        fun offset(t: Long) = "${TimeZone.getDefault().getOffset(t) / 1000}s"
     }
 }

@@ -21,8 +21,9 @@ import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /**
- * Uploads saved runs: TCX to a Google Drive folder (brought into Strava by hand from there),
- * summary to Google Health. A marker file (.drive / .google) records each success so nothing is sent twice.
+ * Uploads saved runs' TCX to a Google Drive folder (brought into Strava by hand from there).
+ * A .drive marker file records each success so nothing is sent twice.
+ * Runs older than [KEEP_DAYS] are deleted from the watch once uploaded.
  */
 class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
 
@@ -42,10 +43,12 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
                     .onSuccess { File("$base.drive").writeText(it); log("ok   drive ${tcx.name} $it") }
                     .onFailure { failed = true; log("FAIL drive ${tcx.name} ${it.message}") }
             }
-            cfg.google?.takeIf { cfg.googleHealth }?.let { c ->
-                if (!File("$base.google").exists()) runCatching { uploadGoogle(c, File("$base.health.json").readText()) }
-                    .onSuccess { File("$base.google").writeText(it); log("ok   health ${tcx.name} $it") }
-                    .onFailure { failed = true; log("FAIL health ${tcx.name} ${it.message}") }
+            // After KEEP_DAYS, a run that has reached everywhere it is sent is deleted from the watch.
+            val sent = cfg.google == null || !cfg.drive || File("$base.drive").exists()
+            if (sent && System.currentTimeMillis() - tcx.lastModified() > TimeUnit.DAYS.toMillis(KEEP_DAYS)) {
+                val stem = File(base).name
+                dir.listFiles { f -> f.name.startsWith("$stem.") }.orEmpty().forEach { it.delete() }
+                log("del  ${tcx.name}")
             }
         }
         return if (failed) Result.retry() else Result.success()
@@ -102,18 +105,6 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         return id
     }
 
-    private fun uploadGoogle(c: Creds, body: String): String {
-        val token = refresh("https://oauth2.googleapis.com/token", c, "google")
-        val conn = URL("https://health.googleapis.com/v4/users/me/dataTypes/exercise/dataPoints")
-            .openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.setRequestProperty("Authorization", "Bearer $token")
-        conn.setRequestProperty("Content-Type", "application/json")
-        conn.outputStream.use { it.write(body.toByteArray()) }
-        return read(conn)
-    }
-
     /** Exchanges the refresh token; if Google issues a new one, it is kept in tokens.json. */
     private fun refresh(url: String, c: Creds, key: String): String {
         val store = File(applicationContext.filesDir, "tokens.json")
@@ -143,6 +134,7 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
     companion object {
         private const val DRIVE_FOLDER = "Geococcyx"
         private const val LOG_LINES = 500
+        private const val KEEP_DAYS = 30L
         private const val FOLDER_MIME = "application/vnd.google-apps.folder"
 
         fun enqueue(ctx: Context) {

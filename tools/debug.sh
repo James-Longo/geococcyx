@@ -19,12 +19,11 @@ fi
 case "${1:-status}" in
   status)
     # Services this build uploads to, read from the config.json it was built and pushed with.
-    services=$(python3 - <<'EOF' 2>/dev/null || echo "drive:drive health:google"
+    services=$(python3 - <<'EOF' 2>/dev/null || echo "drive:drive"
 import json
 c = json.load(open("config.json"))
 out = []
 if c.get("google") and c.get("drive", True): out.append("drive:drive")
-if c.get("google") and c.get("googleHealth", False): out.append("health:google")
 print(" ".join(out))
 EOF
 )

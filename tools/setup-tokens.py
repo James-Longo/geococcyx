@@ -18,9 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONFIG = os.path.join(ROOT, "config.json")
 GOOGLE_CLIENT = os.path.join(ROOT, "google-client.json")
-# Drive: only files this app creates (its run folder). Health: write workouts.
-GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive.file",
-                 "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.writeonly"]
+# Drive: only files this app creates (its run folder).
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
 def load_config():
