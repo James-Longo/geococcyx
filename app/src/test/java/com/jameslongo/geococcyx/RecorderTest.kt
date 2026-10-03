@@ -50,4 +50,13 @@ class RecorderTest {
         assertEquals(2_423_000, info.lapEndActive)
         assertEquals(2_423_000.0, again.activeFromEvents(prevT).toDouble(), 10_000.0)
     }
+
+    @Test
+    fun gpsMetersSinceLap() {
+        // A crash save adds GPS since the last lap to that lap's total, not the whole run's GPS.
+        val rec = Recorder(File.createTempFile("run", ".journal"))
+        for (i in 0..10) rec.addLoc(Loc(i * 1000L, 44.0 + i * 0.001, -68.0, null))
+        assertEquals(rec.gpsMeters() / 2, rec.gpsMeters(5000), 0.5)
+        assertEquals(0.0, rec.gpsMeters(10_000), 0.0)
+    }
 }

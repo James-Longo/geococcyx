@@ -213,7 +213,8 @@ class ExerciseService : LifecycleService() {
                 tick()
             } else {
                 val end = maxOf(rec.locs.lastOrNull()?.t ?: 0, rec.hr.lastOrNull()?.first ?: 0, rec.start)
-                finish(rec.activeFromEvents(end), rec.gpsMeters(), end)
+                // Health Services' total is gone; carry on from the last lap's total with GPS for the rest.
+                finish(rec.activeFromEvents(end), lapStartMeters + rec.gpsMeters(lapStartWall), end)
             }
         }
     }

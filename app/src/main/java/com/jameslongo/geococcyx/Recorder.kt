@@ -74,8 +74,9 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
 
     fun logStep(idx: Int, activeAtStart: Long, metersAtStart: Double) = log("S,$idx,$activeAtStart,$metersAtStart")
 
-    /** GPS path length, used only when a crashed run has to be saved without Health Services' total. */
-    fun gpsMeters(): Double = locs.zipWithNext().sumOf { (a, b) -> haversine(a, b) }
+    /** GPS path length since [from], used only when a crashed run has to be saved without Health Services' total. */
+    fun gpsMeters(from: Long = Long.MIN_VALUE): Double =
+        locs.filter { it.t >= from }.zipWithNext().sumOf { (a, b) -> haversine(a, b) }
 
     /** Active time from the event log, used only for crash recovery. */
     fun activeFromEvents(end: Long): Long {
