@@ -35,11 +35,13 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
 
     private fun log(line: String) = journalFile.appendText(line + "\n")
 
-    fun addLoc(l: Loc) {
+    /** False for a sample already recorded. */
+    fun addLoc(l: Loc): Boolean {
         // Health Services can redeliver a batch; keep samples strictly in time order.
-        if (locs.isNotEmpty() && l.t <= locs.last().t) return
+        if (locs.isNotEmpty() && l.t <= locs.last().t) return false
         locs += l
         log("L,${l.t},${l.lat},${l.lon},${l.alt ?: ""}")
+        return true
     }
 
     fun addHr(t: Long, bpm: Int) {
@@ -93,7 +95,7 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
 
     fun logStep(idx: Int, activeAtStart: Long, metersAtStart: Double) = log("S,$idx,$activeAtStart,$metersAtStart")
 
-    /** GPS path length since [from], used only when a crashed run has to be saved without Health Services' total. */
+    /** GPS path length since [from], for a run picked up after a crash: where its [Odometer] carries on from. */
     fun gpsMeters(from: Long = Long.MIN_VALUE): Double =
         locs.filter { it.t >= from }.zipWithNext().sumOf { (a, b) -> haversine(a, b) }
 

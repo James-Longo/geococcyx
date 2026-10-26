@@ -98,6 +98,7 @@ class ExerciseService : LifecycleService() {
     private var running = false
     private val paceWindow = ArrayDeque<Pair<Long, Double>>()
     private var grade = Grade()
+    private var odo = Odometer()
     private var lapStartWall = 0L
     private var lapStartActive = 0L
     private var lapStartMeters = 0.0
@@ -143,6 +144,7 @@ class ExerciseService : LifecycleService() {
         pacer = if (pacerFast != null && pacerSlow != null) SplitPacer(pacerFast, pacerSlow, cfg.metersPerUnit / 4, cfg.autoLapMeters) else null
         heldSplit = null
         grade = Grade()
+        odo = Odometer()
         val dir = File(filesDir, "runs").apply { mkdirs() }
         saving = false
         rec = Recorder(File(dir, "current.journal").apply { delete() })
@@ -208,11 +210,13 @@ class ExerciseService : LifecycleService() {
         val intervals = if (info.workout == Intervals.NAME) Intervals.load(this) else null
         workout = intervals?.workout() ?: cfg.workouts.firstOrNull { it.name == info.workout }
         lapStartWall = info.lapEndWall; lapStartActive = info.lapEndActive; lapStartMeters = info.lapEndMeters
+        // GPS since the last lap the journal holds; the next fix carries on from its last point.
+        odo = Odometer(lapStartMeters + rec.gpsMeters(lapStartWall), rec.locs.lastOrNull())
         stepIdx = info.stepIdx; stepStartActive = info.stepStartActive; stepStartMeters = info.stepStartMeters
         RunRepo.state.value = RunState(
             status = Status.ACTIVE, mode = info.mode,
             step = workout?.steps?.getOrNull(stepIdx), stepNo = stepIdx, stepCount = workout?.steps?.size ?: 0,
-            race = cfg.races.firstOrNull { it.name == info.race }, meters = info.lapEndMeters,
+            race = cfg.races.firstOrNull { it.name == info.race }, meters = odo.meters,
             intervals = intervals,
         )
         lifecycleScope.launch {
@@ -228,8 +232,8 @@ class ExerciseService : LifecycleService() {
             } else {
                 val end = maxOf(rec.locs.lastOrNull()?.t ?: 0, rec.hr.lastOrNull()?.first ?: 0, rec.start)
                 // Already ended, so just save it: no foreground service, which Android refuses (location type)
-                // unless the app is on screen. Health Services' total is gone; carry on from the last lap's total with GPS for the rest.
-                finish(rec.activeFromEvents(end), lapStartMeters + rec.gpsMeters(lapStartWall), end)
+                // unless the app is on screen.
+                finish(rec.activeFromEvents(end), odo.meters, end)
             }
         }
     }
@@ -253,10 +257,10 @@ class ExerciseService : LifecycleService() {
         val boot = Instant.ofEpochMilli(bootWall)
         val m = u.latestMetrics
         // Each sample keeps its own sensor timestamp, never the delivery time.
-        m.getData(DataType.LOCATION).forEach { p ->
+        val locs = m.getData(DataType.LOCATION).map { p ->
             val v = p.value
-            rec.addLoc(Loc(p.getTimeInstant(boot).toEpochMilli(), v.latitude, v.longitude, Recorder.altitude(v.altitude)))
-        }
+            Loc(p.getTimeInstant(boot).toEpochMilli(), v.latitude, v.longitude, Recorder.altitude(v.altitude))
+        }.filter { rec.addLoc(it) }
         m.getData(DataType.HEART_RATE_BPM).forEach { p -> rec.addHr(p.getTimeInstant(boot).toEpochMilli(), p.value.toInt()) }
         m.getData(DataType.STEPS_PER_MINUTE).forEach { p -> rec.addCadence(p.getTimeInstant(boot).toEpochMilli(), p.value.toDouble()) }
         m.getData(DataType.STRIDE_LENGTH).forEach { p -> rec.addStride(p.getTimeInstant(boot).toEpochMilli(), p.value) }
@@ -275,7 +279,11 @@ class ExerciseService : LifecycleService() {
         }
         running = status == Status.ACTIVE
         if (status != prev) onStatus(prev, status)
-        update { it.copy(status = status, meters = total ?: it.meters, hr = rec.hr.lastOrNull()?.second ?: it.hr) }
+        if (running) {
+            locs.forEach(odo::gps)
+            total?.let { odo.total(it, System.currentTimeMillis()) }
+        }
+        update { it.copy(status = status, meters = odo.meters, hr = rec.hr.lastOrNull()?.second ?: it.hr) }
     }
 
     private fun onStatus(prev: Status, now: Status) {
@@ -287,7 +295,7 @@ class ExerciseService : LifecycleService() {
                 lapStartWall = System.currentTimeMillis()
                 buzz(LONG)
             }
-            now == Status.PAUSED -> { rec.addEvent("PAUSE"); buzz(SHORT) }
+            now == Status.PAUSED -> { rec.addEvent("PAUSE"); odo.pause(); buzz(SHORT) }
             prev == Status.PAUSED && now == Status.ACTIVE -> { rec.addEvent("RESUME"); buzz(SHORT) }
             now == Status.ENDED -> finish()
         }
