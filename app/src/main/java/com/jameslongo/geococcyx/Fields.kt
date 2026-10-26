@@ -16,6 +16,8 @@ fun fmtPace(secPerMeter: Double?, perUnit: Double): String {
 
 fun fmtDist(m: Double, perUnit: Double) = "%.2f".format(m / perUnit)
 
+fun fmtGrade(percent: Double?): String = percent?.let { "%+.0f%%".format(it).replace("-0%", "0%").replace("+0%", "0%") } ?: "--"
+
 /** Data-screen fields, by the keys used in config.json "fields": label to value. */
 fun field(key: String, s: RunState, c: Config): Pair<String, String> {
     val u = c.metersPerUnit
@@ -24,6 +26,8 @@ fun field(key: String, s: RunState, c: Config): Pair<String, String> {
         "time" -> "TIME" to fmtDur(s.activeMs)
         "distance" -> (if (c.unitLabel == "mi") "MILES" else "KM") to fmtDist(s.meters, u)
         "pace" -> "PACE" to fmtPace(s.pace, u)
+        "gap" -> "GAP" to fmtPace(s.gap, u)
+        "grade" -> "GRADE" to fmtGrade(s.grade)
         "avgPace" -> "AVG" to fmtPace(avg, u)
         "hr" -> "HR" to (s.hr?.toString() ?: "--")
         "lap" -> "LAP" to s.lapNo.toString()

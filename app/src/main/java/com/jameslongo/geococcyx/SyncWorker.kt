@@ -62,11 +62,22 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         f.writeText(lines.takeLast(LOG_LINES).joinToString("\n", postfix = "\n"))
     }
 
-    /** Puts the TCX in the Drive folder [DRIVE_FOLDER] as [title], making the folder on first use; returns the file's id. */
+    /**
+     * Puts the TCX in the Drive folder [DRIVE_FOLDER] as [title], making the folder on first use; returns the file's id.
+     * Each file is tagged with the run's file name, and a run already in Drive isn't sent again: an upload can reach
+     * Drive and still fail here when the connection drops before the reply, and the retry used to make a duplicate.
+     */
     private fun uploadDrive(c: Creds, tcx: File, title: String): String {
         val token = refresh("https://oauth2.googleapis.com/token", c, "google")
         val folder = driveFolder(token)
+        val q = URLEncoder.encode(
+            "appProperties has { key='$RUN_KEY' and value='${tcx.name}' } and '$folder' in parents and trashed = false", "UTF-8",
+        )
+        val find = URL("https://www.googleapis.com/drive/v3/files?q=$q&fields=files(id)").openConnection() as HttpURLConnection
+        find.setRequestProperty("Authorization", "Bearer $token")
+        JSONObject(read(find)).getJSONArray("files").optJSONObject(0)?.getString("id")?.let { return it }
         val meta = JSONObject().put("name", title).put("parents", org.json.JSONArray().put(folder))
+            .put("appProperties", JSONObject().put(RUN_KEY, tcx.name))
         val boundary = "----geococcyx${System.nanoTime()}"
         val conn = URL("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id")
             .openConnection() as HttpURLConnection
@@ -133,6 +144,8 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
 
     companion object {
         private const val DRIVE_FOLDER = "Geococcyx"
+        /** Drive appProperties key holding the run's file name on the watch ("2026-10-18T122759.335Z.tcx"). */
+        private const val RUN_KEY = "geococcyxRun"
         private const val LOG_LINES = 500
         private const val KEEP_DAYS = 30L
         private const val FOLDER_MIME = "application/vnd.google-apps.folder"

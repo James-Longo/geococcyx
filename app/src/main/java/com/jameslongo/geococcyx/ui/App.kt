@@ -105,6 +105,25 @@ fun App(act: MainActivity) {
         missing = act.missingPermissions()
     }
     LaunchedEffect(Unit) { if (missing.isNotEmpty()) ask.launch(missing) }
+    fun start(intervals: Boolean = false, pacer: Pair<Double, Double>? = null) {
+        if (missing.isNotEmpty()) { ask.launch(missing); return }
+        ExerciseService.send(act, ExerciseService.ACTION_START) {
+            if (intervals) putExtra(ExerciseService.EXTRA_INTERVALS, true)
+            pacer?.let { putExtra(ExerciseService.EXTRA_PACER_FAST, it.first); putExtra(ExerciseService.EXTRA_PACER_SLOW, it.second) }
+        }
+    }
+    // A tap on the tile: do what its button's chip would, unless a run is already on.
+    val launch = act.launch.value
+    LaunchedEffect(launch) {
+        if (launch == null) return@LaunchedEffect
+        act.launch.value = null
+        if (s.status != Status.IDLE) return@LaunchedEffect
+        when (launch) {
+            MainActivity.LAUNCH_RUN -> { menu = Menu.HOME; start() }
+            MainActivity.LAUNCH_INTERVALS -> menu = Menu.INTERVALS
+            MainActivity.LAUNCH_PACER -> menu = Menu.PACER
+        }
+    }
 
     MaterialTheme {
         Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -114,13 +133,6 @@ fun App(act: MainActivity) {
                 Status.ENDED -> Summary(s, cfg) { RunRepo.state.value = RunState(); cfg = Config.load(act) }
                 Status.IDLE -> {
                     BackHandler(menu != Menu.HOME) { menu = Menu.HOME }
-                    fun start(intervals: Boolean = false, pacer: Pair<Double, Double>? = null) {
-                        if (missing.isNotEmpty()) { ask.launch(missing); return }
-                        ExerciseService.send(act, ExerciseService.ACTION_START) {
-                            if (intervals) putExtra(ExerciseService.EXTRA_INTERVALS, true)
-                            pacer?.let { putExtra(ExerciseService.EXTRA_PACER_FAST, it.first); putExtra(ExerciseService.EXTRA_PACER_SLOW, it.second) }
-                        }
-                    }
                     when (menu) {
                         Menu.HOME -> ChipList(stringResource(R.string.app_name), buildList {
                             add("Run" to { start() })
@@ -239,15 +251,21 @@ private const val PACER_FLASH_MS = 3000L
 private val TOO_FAST_BG = Color(0xFF3AD1F2)
 private val TOO_SLOW_BG = Color(0xFFFF7A1A)
 
-/** Pacer alert: the whole screen says which way you've drifted, current pace dead center. */
+/**
+ * Pacer alert, only for a quarter split out of range: the whole screen says which way,
+ * with that split's (grade-adjusted) pace dead center.
+ */
 @Composable
 private fun PacerFlash(s: RunState, cfg: Config) {
     val dx = rememberDx()
-    val (bg, name) = when (s.pacerZone) { -1 -> TOO_FAST_BG to "TOO FAST"; 1 -> TOO_SLOW_BG to "TOO SLOW"; else -> ACCENT to "ON PACE" }
-    val pace = fmtPace(s.pace, cfg.metersPerUnit)
+    val split = s.pacerSplit ?: return
+    val (bg, name) = if (split.zone < 0) TOO_FAST_BG to "TOO FAST" else TOO_SLOW_BG to "TOO SLOW"
+    val pace = fmtPace(split.pace, cfg.metersPerUnit)
     Box(Modifier.fillMaxSize().background(bg), contentAlignment = Alignment.Center) {
         Text(pace, style = number(dx, fit(pace, 128, 4), Color.Black))
         Text(name, style = label(dx, 26, Color.Black, spacing = 0.2f), modifier = Modifier.offset(y = -dx.dp(78)))
+        val what = "¼ ${cfg.unitLabel.uppercase()}" + if (split.graded) " · GRADE ADJ" else ""
+        Text(what, style = label(dx, 16, Color.Black, spacing = 0.12f), modifier = Modifier.offset(y = dx.dp(78)))
     }
 }
 

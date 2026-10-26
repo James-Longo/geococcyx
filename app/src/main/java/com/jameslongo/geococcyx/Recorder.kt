@@ -28,6 +28,8 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
     val cadence = ArrayList<Pair<Long, Double>>()
     /** Meters, as Health Services reports STRIDE_LENGTH. */
     val stride = ArrayList<Pair<Long, Double>>()
+    /** Meters above sea level from the barometer (ABSOLUTE_ELEVATION); GPS altitude is missing on a Pixel Watch. */
+    val elevation = ArrayList<Pair<Long, Double>>()
     val laps = ArrayList<Lap>()
     val events = ArrayList<Event>()
 
@@ -56,6 +58,23 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
         if (m <= 0 || (stride.isNotEmpty() && t <= stride.last().first)) return
         stride += t to m
         log("R,$t,$m")
+    }
+
+    fun addElevation(t: Long, m: Double) {
+        if (altitude(m) == null || (elevation.isNotEmpty() && t <= elevation.last().first)) return
+        elevation += t to m
+        log("B,$t,$m")
+    }
+
+    /** Mean barometric elevation over the [ms] up to the newest reading; null when there's none. */
+    fun recentElevation(ms: Long = 5000): Double? {
+        val end = elevation.lastOrNull()?.first ?: return null
+        var sum = 0.0; var n = 0
+        for (i in elevation.indices.reversed()) {
+            if (elevation[i].first < end - ms) break
+            sum += elevation[i].second; n++
+        }
+        return sum / n
     }
 
     fun addEvent(type: String, t: Long = System.currentTimeMillis()) {
@@ -90,16 +109,19 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
     private fun avgCadence(from: Long, to: Long): Double? =
         cadence.filter { it.first in from..to }.map { it.second }.takeIf { it.isNotEmpty() }?.average()
 
-    /** Nearest sample within 3 s of the GPS point. */
+    /**
+     * Nearest sample within 3 s of the GPS point (the earlier one on a tie). Series are in time order,
+     * so this is a binary search: a linear scan per point made saving a 90-minute run take seconds.
+     */
     private fun <T> nearest(series: List<Pair<Long, T>>, t: Long): T? {
-        var best: Pair<Long, T>? = null
-        for (h in series) {
-            if (kotlin.math.abs(h.first - t) <= 3000 &&
-                (best == null || kotlin.math.abs(h.first - t) < kotlin.math.abs(best.first - t))
-            ) best = h
-            if (h.first > t + 3000) break
+        var lo = 0
+        var hi = series.size
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (series[mid].first < t) lo = mid + 1 else hi = mid
         }
-        return best?.second
+        val best = listOfNotNull(series.getOrNull(lo - 1), series.getOrNull(lo)).minByOrNull { kotlin.math.abs(it.first - t) }
+        return best?.takeIf { kotlin.math.abs(it.first - t) <= 3000 }?.second
     }
 
     /** Wall-clock spans when the run was paused. */
@@ -132,7 +154,7 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
                 if (prev != null && pauses.any { it.first in prev.t..l.t }) sb.append("</Track>\n<Track>\n")
                 sb.append("<Trackpoint><Time>${iso(l.t)}</Time><Position><LatitudeDegrees>${l.lat}</LatitudeDegrees>")
                 sb.append("<LongitudeDegrees>${l.lon}</LongitudeDegrees></Position>")
-                l.alt?.let { sb.append("<AltitudeMeters>${"%.1f".format(it)}</AltitudeMeters>") }
+                (l.alt ?: nearest(elevation, l.t))?.let { sb.append("<AltitudeMeters>${"%.1f".format(it)}</AltitudeMeters>") }
                 nearest(hr, l.t)?.let { sb.append("<HeartRateBpm><Value>$it</Value></HeartRateBpm>") }
                 // Garmin's RunCadence counts one foot, so it's half of steps per minute.
                 val spm = nearest(cadence, l.t)
@@ -173,6 +195,7 @@ class Recorder(val journalFile: File, val start: Long = System.currentTimeMillis
                     "H" -> rec.hr += f[1].toLong() to f[2].toInt()
                     "C" -> rec.cadence += f[1].toLong() to f[2].toDouble()
                     "R" -> rec.stride += f[1].toLong() to f[2].toDouble()
+                    "B" -> rec.elevation += f[1].toLong() to f[2].toDouble()
                     "E" -> rec.events += Event(f[1].toLong(), f[2])
                     "P" -> {
                         rec.laps += Lap(f[1].toLong(), f[2].toLong(), f[3].toLong(), f[4].toDouble(), f[5], null)

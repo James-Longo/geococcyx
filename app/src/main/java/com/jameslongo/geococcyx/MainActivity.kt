@@ -1,6 +1,7 @@
 package com.jameslongo.geococcyx
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -16,6 +17,8 @@ import com.jameslongo.geococcyx.ui.App
 
 class MainActivity : ComponentActivity() {
     val ambient = mutableStateOf(false)
+    /** What the tile asked for ([LAUNCH_RUN] and so on), until the start screen acts on it. */
+    val launch = mutableStateOf<String?>(null)
 
     private val ambientObserver = AmbientLifecycleObserver(this, object : AmbientLifecycleObserver.AmbientLifecycleCallback {
         override fun onEnterAmbient(ambientDetails: AmbientLifecycleObserver.AmbientDetails) { ambient.value = true }
@@ -31,7 +34,13 @@ class MainActivity : ComponentActivity() {
         }
         // Catch up on any run that hasn't uploaded yet (offline at the time, or saved before sign-in).
         SyncWorker.enqueue(this)
+        launch.value = intent.getStringExtra(EXTRA_LAUNCH)
         setContent { App(this) }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        launch.value = intent.getStringExtra(EXTRA_LAUNCH)
     }
 
     fun missingPermissions(): Array<String> {
@@ -94,6 +103,10 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        const val EXTRA_LAUNCH = "launch"
+        const val LAUNCH_RUN = "run"
+        const val LAUNCH_INTERVALS = "intervals"
+        const val LAUNCH_PACER = "pacer"
         private const val TWIST_PX = 400f
         private const val TWIST_WINDOW_MS = 500L
         private const val TWIST_COOLDOWN_MS = 1500L

@@ -27,11 +27,13 @@ import androidx.health.services.client.data.WarmUpConfig
 import androidx.lifecycle.LifecycleService
 import androidx.wear.ongoing.OngoingActivity
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
 
@@ -45,6 +47,10 @@ data class RunState(
     val hr: Int? = null,
     /** Seconds per meter over the last ~15 s of active time; null when unknown. */
     val pace: Double? = null,
+    /** Percent slope over the last ~100 m from the barometer; null without elevation. */
+    val grade: Double? = null,
+    /** [pace] as its flat-ground equivalent on [grade]; equal to [pace] when the slope is unknown. */
+    val gap: Double? = null,
     val gpsReady: Boolean = false,
     val lapNo: Int = 1,
     val lapMs: Long = 0,
@@ -57,9 +63,9 @@ data class RunState(
     /** Virtual pacer range, seconds per meter: fastest and slowest allowed. */
     val pacerFast: Double? = null,
     val pacerSlow: Double? = null,
-    /** -1 too fast, 0 in range, 1 too slow; null until the pacer has a reading. */
-    val pacerZone: Int? = null,
-    /** Wall-clock time of the last pacer alert; the UI shows it full screen for a few seconds. */
+    /** The pacer's last finished quarter split; null until the first one. */
+    val pacerSplit: SplitPacer.Split? = null,
+    /** Wall-clock time of the last out-of-range split; the UI shows it full screen for a few seconds. */
     val pacerAlertAt: Long? = null,
     val step: Step? = null,
     val stepNo: Int = 0,
@@ -91,6 +97,7 @@ class ExerciseService : LifecycleService() {
     private var cpActive = 0L
     private var running = false
     private val paceWindow = ArrayDeque<Pair<Long, Double>>()
+    private var grade = Grade()
     private var lapStartWall = 0L
     private var lapStartActive = 0L
     private var lapStartMeters = 0.0
@@ -100,9 +107,11 @@ class ExerciseService : LifecycleService() {
     private var offTargetSince = 0L
     private var lastPaceBuzz = 0L
     private var raceFinished = false
-    private var pacerCandidate: Int? = null
-    private var pacerCandidateSince = 0L
+    private var pacer: SplitPacer? = null
+    private var heldSplit: SplitPacer.Split? = null
     private var recovering = false
+    /** Set once [finish] starts writing the run, so nothing more is added to [rec] while it's read. */
+    private var saving = false
 
     private val bootWall get() = System.currentTimeMillis() - SystemClock.elapsedRealtime()
     private fun activeNow() = if (running) cpActive + (System.currentTimeMillis() - cpWall) else cpActive
@@ -130,8 +139,12 @@ class ExerciseService : LifecycleService() {
         val race = cfg.races.firstOrNull { it.name == intent.getStringExtra(EXTRA_RACE) }
         val pacerFast = intent.getDoubleExtra(EXTRA_PACER_FAST, 0.0).takeIf { it > 0 }
         val pacerSlow = intent.getDoubleExtra(EXTRA_PACER_SLOW, 0.0).takeIf { it > 0 }
-        pacerCandidate = null
+        // No workout means auto-laps, so the quarters can end with them.
+        pacer = if (pacerFast != null && pacerSlow != null) SplitPacer(pacerFast, pacerSlow, cfg.metersPerUnit / 4, cfg.autoLapMeters) else null
+        heldSplit = null
+        grade = Grade()
         val dir = File(filesDir, "runs").apply { mkdirs() }
+        saving = false
         rec = Recorder(File(dir, "current.journal").apply { delete() })
         rec.logMeta(workout?.name ?: race?.name ?: "Run", workout?.name, race?.name)
         RunRepo.state.value = RunState(
@@ -162,7 +175,7 @@ class ExerciseService : LifecycleService() {
             val caps = client.getCapabilitiesAsync().await().getExerciseTypeCapabilities(ExerciseType.RUNNING)
             val wanted = setOf(
                 DataType.LOCATION, DataType.HEART_RATE_BPM, DataType.DISTANCE_TOTAL,
-                DataType.STEPS_PER_MINUTE, DataType.STRIDE_LENGTH,
+                DataType.STEPS_PER_MINUTE, DataType.STRIDE_LENGTH, DataType.ABSOLUTE_ELEVATION,
             )
             client.startExerciseAsync(
                 ExerciseConfig.builder(ExerciseType.RUNNING)
@@ -190,6 +203,7 @@ class ExerciseService : LifecycleService() {
         // Killed during warm-up: nothing was recorded.
         if (r.events.none { it.type == "START" }) { journal.delete(); stopSelf(); return }
         rec = r
+        saving = false
         // Intervals aren't in config.json; the setup they started with is still in prefs.
         val intervals = if (info.workout == Intervals.NAME) Intervals.load(this) else null
         workout = intervals?.workout() ?: cfg.workouts.firstOrNull { it.name == info.workout }
@@ -201,19 +215,20 @@ class ExerciseService : LifecycleService() {
             race = cfg.races.firstOrNull { it.name == info.race }, meters = info.lapEndMeters,
             intervals = intervals,
         )
-        ServiceCompat.startForeground(
-            this, 1, notification(),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
-        )
         lifecycleScope.launch {
             val tracked = client.getCurrentExerciseInfoAsync().await().exerciseTrackedStatus
             if (tracked == ExerciseTrackedStatus.OWNED_EXERCISE_IN_PROGRESS) {
+                ServiceCompat.startForeground(
+                    this@ExerciseService, 1, notification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+                )
                 recovering = true
                 client.setUpdateCallback(callback)
                 tick()
             } else {
                 val end = maxOf(rec.locs.lastOrNull()?.t ?: 0, rec.hr.lastOrNull()?.first ?: 0, rec.start)
-                // Health Services' total is gone; carry on from the last lap's total with GPS for the rest.
+                // Already ended, so just save it: no foreground service, which Android refuses (location type)
+                // unless the app is on screen. Health Services' total is gone; carry on from the last lap's total with GPS for the rest.
                 finish(rec.activeFromEvents(end), lapStartMeters + rec.gpsMeters(lapStartWall), end)
             }
         }
@@ -234,6 +249,7 @@ class ExerciseService : LifecycleService() {
     }
 
     private fun onUpdate(u: ExerciseUpdate) {
+        if (saving) return
         val boot = Instant.ofEpochMilli(bootWall)
         val m = u.latestMetrics
         // Each sample keeps its own sensor timestamp, never the delivery time.
@@ -244,6 +260,7 @@ class ExerciseService : LifecycleService() {
         m.getData(DataType.HEART_RATE_BPM).forEach { p -> rec.addHr(p.getTimeInstant(boot).toEpochMilli(), p.value.toInt()) }
         m.getData(DataType.STEPS_PER_MINUTE).forEach { p -> rec.addCadence(p.getTimeInstant(boot).toEpochMilli(), p.value.toDouble()) }
         m.getData(DataType.STRIDE_LENGTH).forEach { p -> rec.addStride(p.getTimeInstant(boot).toEpochMilli(), p.value) }
+        m.getData(DataType.ABSOLUTE_ELEVATION).forEach { p -> rec.addElevation(p.getTimeInstant(boot).toEpochMilli(), p.value) }
         val total = m.getData(DataType.DISTANCE_TOTAL)?.total
         u.activeDurationCheckpoint?.let {
             cpWall = it.time.toEpochMilli()
@@ -287,6 +304,9 @@ class ExerciseService : LifecycleService() {
             }
             val (a0, m0) = paceWindow.firstOrNull() ?: (act to s.meters)
             val pace = if (s.meters - m0 > 10 && act - a0 >= 5_000) (act - a0) / 1000.0 / (s.meters - m0) else null
+            if (running) rec.recentElevation()?.let { grade.add(s.meters, it) }
+            val pct = grade.percent
+            val gap = pace?.let { Grade.adjust(it, pct) }
 
             val wo = workout
             if (wo != null && stepIdx < wo.steps.size) {
@@ -297,12 +317,12 @@ class ExerciseService : LifecycleService() {
             } else if (wo == null && s.meters - lapStartMeters >= cfg.autoLapMeters) {
                 lap("DISTANCE")
             }
-            if (running) checkPacer(pace, act)
+            if (running) checkPacer(act, s.meters, pct)
             s.race?.let { r -> if (!raceFinished && s.meters >= r.meters) { raceFinished = true; buzz(TRIPLE) } }
 
             update {
                 it.copy(
-                    activeMs = act, pace = pace,
+                    activeMs = act, pace = pace, grade = pct, gap = gap,
                     lapNo = rec.laps.size + 1, lapMs = act - lapStartActive, lapMeters = it.meters - lapStartMeters,
                     stepMs = act - stepStartActive, stepMeters = it.meters - stepStartMeters,
                 )
@@ -327,22 +347,23 @@ class ExerciseService : LifecycleService() {
     }
 
     /**
-     * Virtual pacer: alerts once when the rolling pace leaves the range and once when it comes back.
-     * A zone must hold for PACER_SETTLE_MS so GPS jitter doesn't set it off, and the standing start
-     * (PACER_GRACE_MS) is ignored. The first reading only alerts if it's already out of range.
+     * Virtual pacer: at each quarter split, judges that split's grade-adjusted pace against the range
+     * (so a climb isn't "too slow" and a descent isn't "too fast"). Silent when it's in range.
      */
-    private fun checkPacer(pace: Double?, act: Long) {
-        val s = RunRepo.state.value
-        val fast = s.pacerFast ?: return
-        val slow = s.pacerSlow ?: return
-        if (pace == null || act < PACER_GRACE_MS) return
-        val zone = when { pace < fast -> -1; pace > slow -> 1; else -> 0 }
+    private fun checkPacer(act: Long, meters: Double, percent: Double?) {
+        pacer?.tick(act, meters, percent)?.let { onSplit(it) }
+        val held = heldSplit ?: return
+        // A mile split keeps its buzz and screen (its last quarter ends with it); the warning waits its turn.
         val now = System.currentTimeMillis()
-        if (zone != pacerCandidate) { pacerCandidate = zone; pacerCandidateSince = now }
-        if (zone == s.pacerZone || now - pacerCandidateSince < PACER_SETTLE_MS) return
-        if (s.pacerZone == null && zone == 0) return update { it.copy(pacerZone = 0) }
-        buzz(when (zone) { -1 -> TOO_FAST; 1 -> TOO_SLOW; else -> BACK_ON_PACE })
-        update { it.copy(pacerZone = zone, pacerAlertAt = now) }
+        if (now - (RunRepo.state.value.lastLapAt ?: 0) < LAP_QUIET_MS) return
+        heldSplit = null
+        buzz(if (held.zone < 0) TOO_FAST else TOO_SLOW)
+        update { it.copy(pacerSplit = held, pacerAlertAt = now) }
+    }
+
+    /** An out-of-range split is held for [checkPacer] to announce; an in-range one is just noted. */
+    private fun onSplit(split: SplitPacer.Split) {
+        if (split.zone != 0) heldSplit = split else update { it.copy(pacerSplit = split) }
     }
 
     private fun advanceStep(trigger: String) {
@@ -376,11 +397,14 @@ class ExerciseService : LifecycleService() {
         val act = activeNow()
         rec.addLap(Lap(lapStartWall, now, act - lapStartActive, s.meters - lapStartMeters, trigger, rec.avgHr(lapStartWall, now)), act, s.meters)
         update { it.copy(lastLapMs = act - lapStartActive, lastLapMeters = s.meters - lapStartMeters, lastLapNo = rec.laps.size, lastLapAt = now) }
+        pacer?.lap(act, s.meters)?.let { onSplit(it) }
         lapStartWall = now; lapStartActive = act; lapStartMeters = s.meters
         if (!fromStep) buzz(if (trigger == "DISTANCE") MILE else SHORT)
     }
 
     private fun finish(activeMs: Long = cpActive, meters: Double = RunRepo.state.value.meters, now: Long = System.currentTimeMillis()) {
+        if (saving) return
+        saving = true
         rec.addEvent("STOP", now)
         cpActive = activeMs
         update { it.copy(meters = meters) }
@@ -388,18 +412,30 @@ class ExerciseService : LifecycleService() {
         if (now - lapStartWall > 2000 || rec.laps.isEmpty()) {
             rec.addLap(Lap(lapStartWall, now, cpActive - lapStartActive, s.meters - lapStartMeters, "MANUAL", rec.avgHr(lapStartWall, now)), cpActive, s.meters)
         }
-        val base = File(File(filesDir, "runs"), Recorder.iso(rec.start).replace(":", ""))
-        File("$base.tcx").writeText(rec.toTcx())
-        File("$base.meta.json").writeText(org.json.JSONObject().put("name", s.mode).put("activeMs", cpActive).put("meters", s.meters)
+        val r = rec
+        val base = File(File(filesDir, "runs"), Recorder.iso(r.start).replace(":", ""))
+        val meta = org.json.JSONObject().put("name", s.mode).put("activeMs", cpActive).put("meters", s.meters)
             // Start time and the watch's (network-set) time zone, so the run is named in local time wherever it uploads.
-            .put("start", rec.start).put("tz", java.util.TimeZone.getDefault().id).toString())
-        File(File(filesDir, "runs"), "current.journal").delete()
-        // Every finished run is uploaded; SyncWorker deletes it from the watch after 30 days.
-        SyncWorker.enqueue(this)
-        buzz(LONG)
-        update { it.copy(status = Status.ENDED, activeMs = cpActive, savedFile = base.name) }
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
+            .put("start", r.start).put("tz", java.util.TimeZone.getDefault().id).toString()
+        // Ended now: no more laps, and the tick loop stops.
+        update { it.copy(status = Status.ENDED, activeMs = cpActive) }
+        lifecycleScope.launch {
+            // A long run's TCX takes a while to build; on the main thread the watch stopped responding
+            // to touches, and closing it from the "not responding" dialog lost the save.
+            withContext(Dispatchers.IO) {
+                File("$base.tcx").writeText(r.toTcx())
+                File("$base.meta.json").writeText(meta)
+            }
+            // Every finished run is uploaded; SyncWorker deletes it from the watch after 30 days.
+            SyncWorker.enqueue(this@ExerciseService)
+            buzz(LONG)
+            // A new run may have started from the summary while this one was being written; leave it alone.
+            if (rec !== r) return@launch
+            r.journalFile.delete()
+            update { it.copy(savedFile = base.name) }
+            ServiceCompat.stopForeground(this@ExerciseService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     /** Back out of the warm-up without recording anything. */
@@ -454,21 +490,21 @@ class ExerciseService : LifecycleService() {
         const val EXTRA_INTERVALS = "intervals"
         const val EXTRA_PACER_FAST = "pacerFast"
         const val EXTRA_PACER_SLOW = "pacerSlow"
-        private const val PACER_GRACE_MS = 30_000L
-        private const val PACER_SETTLE_MS = 5_000L
         private val SHORT = longArrayOf(0, 150)
         private val DOUBLE = longArrayOf(0, 120, 120, 120)
         private val TRIPLE = longArrayOf(0, 200, 150, 200, 150, 200)
         private val LONG = longArrayOf(0, 500)
         private val MILE = longArrayOf(0, 400, 150, 400)
-        // Pacer: quick pulses when too fast, one long pull when too slow, a double tap when back in range.
+        /** A quarter warning landing on a lap waits this long: the lap's flash (5 s) plus a beat. */
+        private const val LAP_QUIET_MS = 7_000L
+        // Pacer, only for a split out of range: quick pulses when too fast, one long pull when too slow.
         private val TOO_FAST = longArrayOf(0, 100, 80, 100, 80, 100, 80, 100)
         private val TOO_SLOW = longArrayOf(0, 900)
-        private val BACK_ON_PACE = longArrayOf(0, 200, 120, 200)
 
         fun send(ctx: Context, action: String, extras: Intent.() -> Unit = {}) {
             val i = Intent(ctx, ExerciseService::class.java).setAction(action).apply(extras)
-            if (action == ACTION_START || action == ACTION_RECOVER) ctx.startForegroundService(i) else ctx.startService(i)
+            // Recovery goes foreground only if the run is still going (see [recover]), so it mustn't promise to.
+            if (action == ACTION_START) ctx.startForegroundService(i) else ctx.startService(i)
         }
     }
 }
